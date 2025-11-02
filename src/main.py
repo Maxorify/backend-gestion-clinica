@@ -3,12 +3,14 @@ from src.utils.supabase import supabase_client
 from fastapi import FastAPI
 from src.routers.user_administration import user_router
 from src.routers.doctor_administration import doctor_router
+from src.routers.auth import auth_router
 import os
 
 
 
 app = FastAPI()
 
+app.include_router(auth_router)
 app.include_router(user_router)
 app.include_router(doctor_router)
 
