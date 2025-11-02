@@ -1,0 +1,183 @@
+-- WARNING: This schema is for context only and is not meant to be run.
+-- Table order and constraints may not be valid for execution.
+
+CREATE TABLE public.asignacion_de_hora (
+  id bigint NOT NULL DEFAULT nextval('asignacion_de_hora_id_seq'::regclass),
+  inicio_bloque timestamp with time zone NOT NULL,
+  finalizacion_bloque timestamp with time zone NOT NULL,
+  usuario_sistema_id bigint NOT NULL,
+  CONSTRAINT asignacion_de_hora_pkey PRIMARY KEY (id),
+  CONSTRAINT asignacion_de_hora_usuario_sistema_id_fkey FOREIGN KEY (usuario_sistema_id) REFERENCES public.usuario_sistema(id)
+);
+CREATE TABLE public.asistencia (
+  id bigint NOT NULL DEFAULT nextval('asistencia_id_seq'::regclass),
+  inicio_turno timestamp with time zone NOT NULL,
+  finalizacion_turno timestamp with time zone,
+  usuario_sistema_id bigint NOT NULL,
+  CONSTRAINT asistencia_pkey PRIMARY KEY (id),
+  CONSTRAINT asistencia_usuario_sistema_id_fkey FOREIGN KEY (usuario_sistema_id) REFERENCES public.usuario_sistema(id)
+);
+CREATE TABLE public.cita_medica (
+  id bigint NOT NULL DEFAULT nextval('cita_medica_id_seq'::regclass),
+  fecha_atencion timestamp with time zone NOT NULL,
+  paciente_id bigint NOT NULL,
+  doctor_id bigint NOT NULL,
+  CONSTRAINT cita_medica_pkey PRIMARY KEY (id),
+  CONSTRAINT cita_medica_paciente_id_fkey FOREIGN KEY (paciente_id) REFERENCES public.paciente(id),
+  CONSTRAINT cita_medica_doctor_id_fkey FOREIGN KEY (doctor_id) REFERENCES public.usuario_sistema(id)
+);
+CREATE TABLE public.contraseñas (
+  id bigint NOT NULL DEFAULT nextval('"contraseñas_id_seq"'::regclass),
+  contraseña_temporal character varying,
+  contraseña character varying,
+  id_profesional_salud bigint,
+  CONSTRAINT contraseñas_pkey PRIMARY KEY (id),
+  CONSTRAINT contraseñas_id_profesional_salud_fkey FOREIGN KEY (id_profesional_salud) REFERENCES public.usuario_sistema(id)
+);
+CREATE TABLE public.costos_servicio (
+  id bigint NOT NULL DEFAULT nextval('costos_servicio_id_seq'::regclass),
+  servicio text NOT NULL,
+  precio numeric NOT NULL,
+  especialidad_id bigint,
+  CONSTRAINT costos_servicio_pkey PRIMARY KEY (id),
+  CONSTRAINT costos_servicio_especialidad_id_fkey FOREIGN KEY (especialidad_id) REFERENCES public.especialidad(id)
+);
+CREATE TABLE public.detalle (
+  id bigint NOT NULL DEFAULT nextval('detalle_id_seq'::regclass),
+  descuento_aseguradora numeric,
+  costo_servicio_id bigint NOT NULL,
+  pago_id bigint NOT NULL,
+  CONSTRAINT detalle_pkey PRIMARY KEY (id),
+  CONSTRAINT detalle_costo_servicio_id_fkey FOREIGN KEY (costo_servicio_id) REFERENCES public.costos_servicio(id),
+  CONSTRAINT detalle_pago_id_fkey FOREIGN KEY (pago_id) REFERENCES public.pagos(id)
+);
+CREATE TABLE public.diagnosticos (
+  id bigint NOT NULL DEFAULT nextval('diagnosticos_id_seq'::regclass),
+  nombre_enfermedad text NOT NULL,
+  descripcion_enfermedad text,
+  CONSTRAINT diagnosticos_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.especialidad (
+  id bigint NOT NULL DEFAULT nextval('especialidad_id_seq'::regclass),
+  nombre text NOT NULL,
+  descripcion text,
+  CONSTRAINT especialidad_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.especialidad_con_subespecialidad (
+  id bigint NOT NULL DEFAULT nextval('especialidad_con_subespecialidad_id_seq'::regclass),
+  especialidad_id bigint NOT NULL,
+  sub_especialidad_id bigint NOT NULL,
+  CONSTRAINT especialidad_con_subespecialidad_pkey PRIMARY KEY (id),
+  CONSTRAINT especialidad_con_subespecialidad_especialidad_id_fkey FOREIGN KEY (especialidad_id) REFERENCES public.especialidad(id),
+  CONSTRAINT especialidad_con_subespecialidad_sub_especialidad_id_fkey FOREIGN KEY (sub_especialidad_id) REFERENCES public.sub_especialidad(id)
+);
+CREATE TABLE public.especialidades_doctor (
+  id bigint NOT NULL DEFAULT nextval('especialidades_doctor_id_seq'::regclass),
+  usuario_sistema_id bigint NOT NULL,
+  especialidad_id bigint,
+  sub_especialidad_id bigint,
+  CONSTRAINT especialidades_doctor_pkey PRIMARY KEY (id),
+  CONSTRAINT especialidades_doctor_usuario_sistema_id_fkey FOREIGN KEY (usuario_sistema_id) REFERENCES public.usuario_sistema(id),
+  CONSTRAINT especialidades_doctor_especialidad_id_fkey FOREIGN KEY (especialidad_id) REFERENCES public.especialidad(id),
+  CONSTRAINT especialidades_doctor_sub_especialidad_id_fkey FOREIGN KEY (sub_especialidad_id) REFERENCES public.sub_especialidad(id)
+);
+CREATE TABLE public.estado (
+  id bigint NOT NULL DEFAULT nextval('estado_id_seq'::regclass),
+  estado text NOT NULL,
+  cita_medica_id bigint NOT NULL,
+  CONSTRAINT estado_pkey PRIMARY KEY (id),
+  CONSTRAINT estado_cita_medica_id_fkey FOREIGN KEY (cita_medica_id) REFERENCES public.cita_medica(id)
+);
+CREATE TABLE public.horarios_personal (
+  id bigint NOT NULL DEFAULT nextval('horarios_personal_id_seq'::regclass),
+  inicio_bloque timestamp with time zone NOT NULL,
+  finalizacion_bloque timestamp with time zone NOT NULL,
+  usuario_sistema_id bigint NOT NULL,
+  CONSTRAINT horarios_personal_pkey PRIMARY KEY (id),
+  CONSTRAINT horarios_personal_usuario_sistema_id_fkey FOREIGN KEY (usuario_sistema_id) REFERENCES public.usuario_sistema(id)
+);
+CREATE TABLE public.informacion_cita (
+  id bigint NOT NULL DEFAULT nextval('informacion_cita_id_seq'::regclass),
+  motivo_consulta text,
+  antecedentes text,
+  dolores_sintomas text,
+  atenciones_quirurgicas text,
+  evaluacion_doctor text,
+  tratamiento text,
+  diagnostico_id bigint,
+  cita_medica_id bigint NOT NULL UNIQUE,
+  CONSTRAINT informacion_cita_pkey PRIMARY KEY (id),
+  CONSTRAINT informacion_cita_diagnostico_id_fkey FOREIGN KEY (diagnostico_id) REFERENCES public.diagnosticos(id),
+  CONSTRAINT informacion_cita_cita_medica_id_fkey FOREIGN KEY (cita_medica_id) REFERENCES public.cita_medica(id)
+);
+CREATE TABLE public.paciente (
+  id bigint NOT NULL DEFAULT nextval('paciente_id_seq'::regclass),
+  nombre text NOT NULL,
+  apellido_paterno text,
+  apellido_materno text,
+  fecha_nacimiento date,
+  sexo text,
+  estado_civil text,
+  rut text UNIQUE,
+  direccion text,
+  telefono text,
+  correo text,
+  ocupacion text,
+  persona_responsable text,
+  alergias text,
+  prevencion_id bigint,
+  CONSTRAINT paciente_pkey PRIMARY KEY (id),
+  CONSTRAINT paciente_prevencion_id_fkey FOREIGN KEY (prevencion_id) REFERENCES public.prevencion(id)
+);
+CREATE TABLE public.pagos (
+  id bigint NOT NULL DEFAULT nextval('pagos_id_seq'::regclass),
+  fecha_pago timestamp with time zone NOT NULL,
+  tipo_pago text,
+  total numeric NOT NULL,
+  cita_medica_id bigint NOT NULL,
+  CONSTRAINT pagos_pkey PRIMARY KEY (id),
+  CONSTRAINT pagos_cita_medica_id_fkey FOREIGN KEY (cita_medica_id) REFERENCES public.cita_medica(id)
+);
+CREATE TABLE public.prevencion (
+  id bigint NOT NULL DEFAULT nextval('prevencion_id_seq'::regclass),
+  nombre text NOT NULL UNIQUE,
+  descripcion text,
+  CONSTRAINT prevencion_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.receta (
+  id bigint NOT NULL DEFAULT nextval('receta_id_seq'::regclass),
+  nombre text NOT NULL,
+  presentacion text,
+  dosis text,
+  duracion text,
+  cantidad text,
+  informacion_cita_id bigint NOT NULL,
+  CONSTRAINT receta_pkey PRIMARY KEY (id),
+  CONSTRAINT receta_informacion_cita_id_fkey FOREIGN KEY (informacion_cita_id) REFERENCES public.informacion_cita(id)
+);
+CREATE TABLE public.rol (
+  id bigint NOT NULL DEFAULT nextval('rol_id_seq'::regclass),
+  nombre text NOT NULL,
+  descripcion text,
+  CONSTRAINT rol_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.sub_especialidad (
+  id bigint NOT NULL DEFAULT nextval('sub_especialidad_id_seq'::regclass),
+  nombre text NOT NULL,
+  descripcion text,
+  CONSTRAINT sub_especialidad_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.usuario_sistema (
+  id bigint NOT NULL DEFAULT nextval('usuario_sistema_id_seq'::regclass),
+  nombre text NOT NULL,
+  apellido_paterno text,
+  apellido_materno text,
+  rut text,
+  email text UNIQUE,
+  celular text,
+  cel_secundario text,
+  direccion text,
+  rol_id bigint,
+  CONSTRAINT usuario_sistema_pkey PRIMARY KEY (id),
+  CONSTRAINT usuario_sistema_rol_id_fkey FOREIGN KEY (rol_id) REFERENCES public.rol(id)
+);
