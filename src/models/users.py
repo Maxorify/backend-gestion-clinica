@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 class Usuario(BaseModel):
     nombre: str
@@ -8,10 +8,11 @@ class Usuario(BaseModel):
     rut: str
     email: str
     celular: str
-    cel_secundario: str
+    cel_secundario: Optional[str] = None
     direccion: str
     rol_id: int
-    especialidad_id: str
+    especialidad_id: Optional[str] = None
+    contraseña_temporal: Optional[str] = None  # Nueva: para crear doctores con clave temporal
 
 class Rol(BaseModel):
     nombre: str

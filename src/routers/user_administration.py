@@ -193,11 +193,21 @@ async def crear_usuario(usuario: Usuario):
         if not nuevo.data:
             raise HTTPException(status_code=500, detail="No se pudo crear el usuario.")
 
+        usuario_id = nuevo.data[0]["id"]
+
         # Si tiene especialidad, agregar a especialidades_doctor
         if usuario.especialidad_id and usuario.especialidad_id != "":
             supabase_client.table("especialidades_doctor").insert({
-                "usuario_sistema_id": nuevo.data[0]["id"],
+                "usuario_sistema_id": usuario_id,
                 "especialidad_id": int(usuario.especialidad_id)
+            }).execute()
+
+        # Si tiene contraseña temporal, crear registro en tabla contraseñas
+        if usuario.contraseña_temporal and usuario.contraseña_temporal != "":
+            supabase_client.table("contraseñas").insert({
+                "id_profesional_salud": usuario_id,
+                "contraseña_temporal": usuario.contraseña_temporal,
+                "contraseña": None  # La contraseña permanente se establecerá al primer login
             }).execute()
 
         return {"mensaje": "Usuario creado correctamente.", "usuario": nuevo.data[0]}
@@ -245,6 +255,7 @@ async def modificar_usuario(usuario_id: int, usuario: Usuario):
                 "rut": usuario.rut,
                 "email": usuario.email,
                 "celular": usuario.celular,
+                "cel_secundario": usuario.cel_secundario,
                 "direccion": usuario.direccion,
                 "rol_id": usuario.rol_id
             })
@@ -353,6 +364,57 @@ async def listar_roles():
             raise HTTPException(status_code=404, detail="No hay roles registrados.")
 
         return {"roles": res.data}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@user_router.post("/generar-clave-temporal/{usuario_id}")
+async def generar_clave_temporal(usuario_id: int, contraseña_temporal: str = Query(..., description="Contraseña temporal a establecer")):
+    """
+    Genera o actualiza la contraseña temporal de un usuario (doctor).
+    """
+    try:
+        # Verificar que el usuario existe
+        usuario = (
+            supabase_client
+            .table("usuario_sistema")
+            .select("id, rol_id")
+            .eq("id", usuario_id)
+            .execute()
+        )
+
+        if not usuario.data:
+            raise HTTPException(status_code=404, detail="No existe el usuario.")
+
+        # Verificar si ya tiene un registro en la tabla contraseñas
+        registro_password = (
+            supabase_client
+            .table("contraseñas")
+            .select("id")
+            .eq("id_profesional_salud", usuario_id)
+            .execute()
+        )
+
+        if registro_password.data:
+            # Actualizar la contraseña temporal existente
+            supabase_client.table("contraseñas").update({
+                "contraseña_temporal": contraseña_temporal
+            }).eq("id_profesional_salud", usuario_id).execute()
+        else:
+            # Crear nuevo registro con contraseña temporal
+            supabase_client.table("contraseñas").insert({
+                "id_profesional_salud": usuario_id,
+                "contraseña_temporal": contraseña_temporal,
+                "contraseña": None
+            }).execute()
+
+        return {
+            "mensaje": "Contraseña temporal generada correctamente.",
+            "contraseña_temporal": contraseña_temporal
+        }
 
     except HTTPException:
         raise
