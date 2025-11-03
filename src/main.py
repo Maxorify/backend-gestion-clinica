@@ -7,6 +7,10 @@ from src.routers.patient_administration import patient_router
 from src.routers.appointment_administration import appointment_router
 from src.routers.schedule_administration import schedule_router
 from src.routers.auth import auth_router
+from src.routers.attendance_administration import attendance_router
+from src.routers.settings_administration import settings_router
+from src.routers.profile_administration import profile_router
+from src.routers.dashboard_administration import dashboard_router
 import os
 
 
@@ -19,6 +23,10 @@ app.include_router(doctor_router)
 app.include_router(patient_router)
 app.include_router(appointment_router)
 app.include_router(schedule_router)
+app.include_router(attendance_router)
+app.include_router(settings_router)
+app.include_router(profile_router)
+app.include_router(dashboard_router)
 
 app.add_middleware(
     CORSMiddleware,
