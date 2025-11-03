@@ -8,7 +8,6 @@ class CitaMedica(BaseModel):
     fecha_atencion: datetime = Field(..., description="Fecha y hora de la cita")
     paciente_id: int = Field(..., description="ID del paciente")
     doctor_id: int = Field(..., description="ID del doctor")
-    horario_id: Optional[int] = Field(None, description="ID del bloque de horario reservado")
 
 
 class InformacionCita(BaseModel):

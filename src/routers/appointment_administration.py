@@ -29,48 +29,69 @@ async def crear_cita(cita_completa: CrearCitaCompleta):
         if not paciente.data:
             raise HTTPException(status_code=404, detail="El paciente no existe.")
 
-        # Verificar que el doctor existe
+        # Verificar que el doctor existe y es médico
         doctor = (
             supabase_client
             .table("usuario_sistema")
-            .select("id, nombre, apellido_paterno")
+            .select("id, nombre, apellido_paterno, rol_id")
             .eq("id", cita_completa.cita.doctor_id)
             .execute()
         )
         if not doctor.data:
             raise HTTPException(status_code=404, detail="El doctor no existe.")
 
-        # Si se proporciona horario_id, verificar que esté disponible
-        if cita_completa.cita.horario_id:
-            # Verificar que el horario existe
-            horario = supabase_client.table("horarios_personal").select("id, usuario_sistema_id").eq(
-                "id", cita_completa.cita.horario_id
-            ).execute()
-            
-            if not horario.data:
-                raise HTTPException(status_code=404, detail="El horario especificado no existe.")
-            
-            # Verificar que el horario pertenece al doctor
-            if horario.data[0]["usuario_sistema_id"] != cita_completa.cita.doctor_id:
-                raise HTTPException(status_code=400, detail="El horario no pertenece al doctor seleccionado.")
-            
-            # Verificar que el horario no esté ocupado
-            cita_existente = supabase_client.table("cita_medica").select("id").eq(
-                "horario_id", cita_completa.cita.horario_id
-            ).execute()
-            
-            if cita_existente.data:
-                raise HTTPException(status_code=409, detail="Este horario ya está ocupado.")
+        if doctor.data[0].get("rol_id") != 2:
+            raise HTTPException(status_code=400, detail="El usuario seleccionado no es un doctor.")
+
+        # Verificar que el doctor tenga horarios disponibles en la fecha/hora seleccionada
+        fecha_cita = cita_completa.cita.fecha_atencion
+
+        # Buscar horarios del doctor que contengan esta fecha/hora
+        horarios_doctor = (
+            supabase_client
+            .table("horarios_personal")
+            .select("id, inicio_bloque, finalizacion_bloque")
+            .eq("usuario_sistema_id", cita_completa.cita.doctor_id)
+            .lte("inicio_bloque", fecha_cita.isoformat())
+            .gte("finalizacion_bloque", fecha_cita.isoformat())
+            .execute()
+        )
+
+        if not horarios_doctor.data:
+            raise HTTPException(
+                status_code=409,
+                detail="El doctor no tiene horarios asignados para la fecha/hora seleccionada."
+            )
+
+        # Verificar que no exista otra cita en la misma fecha/hora para este doctor
+        cita_existente = (
+            supabase_client
+            .table("cita_medica")
+            .select("id, estado(estado)")
+            .eq("doctor_id", cita_completa.cita.doctor_id)
+            .eq("fecha_atencion", fecha_cita.isoformat())
+            .execute()
+        )
+
+        # Verificar que no sea una cita cancelada
+        for cita in (cita_existente.data or []):
+            estado_list = cita.get("estado", [])
+            if estado_list:
+                estado_actual = estado_list[0].get("estado") if isinstance(estado_list, list) else estado_list.get("estado")
+                if estado_actual != "Cancelada":
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Ya existe una cita para este doctor en la fecha/hora seleccionada."
+                    )
 
         # Crear la cita médica
         nueva_cita = (
             supabase_client
             .table("cita_medica")
             .insert({
-                "fecha_atencion": cita_completa.cita.fecha_atencion.isoformat(),
+                "fecha_atencion": fecha_cita.isoformat(),
                 "paciente_id": cita_completa.cita.paciente_id,
-                "doctor_id": cita_completa.cita.doctor_id,
-                "horario_id": cita_completa.cita.horario_id
+                "doctor_id": cita_completa.cita.doctor_id
             })
             .execute()
         )

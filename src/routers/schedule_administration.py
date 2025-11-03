@@ -79,7 +79,7 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
         while fecha_actual <= fecha_fin:
             # Verificar si es el día de la semana correcto (0=Lunes, 6=Domingo)
             if fecha_actual.weekday() == horario.dia_semana:
-                # Crear bloques para este día (sin timezone, se guarda como hora local)
+                # Crear bloques para este día en hora local de Chile
                 hora_bloque = datetime.combine(
                     fecha_actual,
                     datetime.strptime(horario.hora_inicio, "%H:%M").time()
@@ -88,11 +88,15 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
                     fecha_actual,
                     datetime.strptime(horario.hora_fin, "%H:%M").time()
                 )
-                
-                # Ajustar a timezone de Chile (UTC-3)
+
+                # Marcar como hora local de Chile (UTC-3) y luego convertir a UTC
                 chile_tz = timezone(timedelta(hours=-3))
                 hora_bloque = hora_bloque.replace(tzinfo=chile_tz)
                 hora_fin_dia = hora_fin_dia.replace(tzinfo=chile_tz)
+
+                # Convertir a UTC para guardar en la BD
+                hora_bloque = hora_bloque.astimezone(timezone.utc)
+                hora_fin_dia = hora_fin_dia.astimezone(timezone.utc)
                 
                 while hora_bloque < hora_fin_dia:
                     fin_bloque = hora_bloque + timedelta(minutes=horario.duracion_bloque_minutos)
@@ -320,35 +324,82 @@ async def listar_horarios_disponibles(
 ):
     """
     Lista los horarios disponibles (sin cita asignada) de un doctor en un rango de fechas.
-    Opcionalmente filtra por especialidad.
+    Verifica tanto horarios con horario_id asignado como citas que se solapan por fecha_atencion.
     """
     try:
-        # Obtener todos los horarios del doctor en el rango
+        # Parsear las fechas del frontend (vienen en ISO con timezone)
+        # y asegurar que estén en UTC para comparar con la BD
+        fecha_inicio_dt = datetime.fromisoformat(fecha_inicio.replace('Z', '+00:00'))
+        fecha_fin_dt = datetime.fromisoformat(fecha_fin.replace('Z', '+00:00'))
+
+        print(f"DEBUG: Fechas parseadas - Inicio: {fecha_inicio_dt}, Fin: {fecha_fin_dt}")
+
+        # Obtener todos los horarios del doctor que se solapan con el rango
+        # Buscar horarios donde inicio_bloque <= fecha_fin Y finalizacion_bloque >= fecha_inicio
         query = supabase_client.table("horarios_personal").select(
             "id, inicio_bloque, finalizacion_bloque, usuario_sistema_id"
-        ).eq("usuario_sistema_id", doctor_id).gte(
-            "inicio_bloque", fecha_inicio
-        ).lte("finalizacion_bloque", fecha_fin).order("inicio_bloque", desc=False)
-        
+        ).eq("usuario_sistema_id", doctor_id).lte(
+            "inicio_bloque", fecha_fin_dt.isoformat()
+        ).gte("finalizacion_bloque", fecha_inicio_dt.isoformat()).order("inicio_bloque", desc=False)
+
         horarios = query.execute()
-        
+
         if not horarios.data:
+            print(f"DEBUG: No se encontraron horarios para doctor {doctor_id}")
             return {"horarios_disponibles": []}
-        
-        # Obtener citas que tienen horario asignado
-        citas_con_horario = supabase_client.table("cita_medica").select(
-            "horario_id"
-        ).not_.is_("horario_id", "null").execute()
-        
-        horarios_ocupados = set([c["horario_id"] for c in (citas_con_horario.data or [])])
-        
+
+        # Obtener TODAS las citas del doctor en el rango de fechas
+        citas_doctor = supabase_client.table("cita_medica").select(
+            "id, fecha_atencion, doctor_id, estado(estado)"
+        ).eq("doctor_id", doctor_id).gte(
+            "fecha_atencion", fecha_inicio_dt.isoformat()
+        ).lte("fecha_atencion", fecha_fin_dt.isoformat()).execute()
+
+        print(f"DEBUG: Doctor ID: {doctor_id}")
+        print(f"DEBUG: Rango de fechas: {fecha_inicio} a {fecha_fin}")
+        print(f"DEBUG: Horarios encontrados: {len(horarios.data)}")
+        if horarios.data:
+            for h in horarios.data:
+                print(f"  - Horario {h['id']}: {h['inicio_bloque']} a {h['finalizacion_bloque']}")
+        print(f"DEBUG: Citas encontradas: {len(citas_doctor.data or [])}")
+
+        # Crear set de horarios ocupados
+        horarios_ocupados = set()
+
+        for cita in (citas_doctor.data or []):
+            # Obtener el estado de la cita
+            estado_list = cita.get("estado", [])
+            if estado_list:
+                estado_actual = estado_list[0].get("estado") if isinstance(estado_list, list) else estado_list.get("estado")
+                # Ignorar citas canceladas
+                if estado_actual == "Cancelada":
+                    print(f"DEBUG: Ignorando cita cancelada ID {cita['id']}")
+                    continue
+
+            fecha_cita = datetime.fromisoformat(cita["fecha_atencion"].replace('Z', '+00:00'))
+            print(f"DEBUG: Procesando cita {cita['id']} con fecha {fecha_cita}")
+
+            # Verificar qué horario ocupa esta cita
+            for horario in horarios.data:
+                inicio = datetime.fromisoformat(horario["inicio_bloque"].replace('Z', '+00:00'))
+                fin = datetime.fromisoformat(horario["finalizacion_bloque"].replace('Z', '+00:00'))
+
+                # Si la cita está dentro del bloque de horario, marcarlo como ocupado
+                if inicio <= fecha_cita < fin:
+                    print(f"DEBUG: Horario {horario['id']} ocupado por cita {cita['id']}")
+                    horarios_ocupados.add(horario["id"])
+                    break
+
         # Filtrar solo horarios disponibles
         horarios_disponibles = [
-            h for h in horarios.data 
+            h for h in horarios.data
             if h["id"] not in horarios_ocupados
         ]
-        
+
+        print(f"DEBUG: Horarios ocupados: {horarios_ocupados}")
+        print(f"DEBUG: Horarios disponibles finales: {len(horarios_disponibles)}")
+
         return {"horarios_disponibles": horarios_disponibles}
-    
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
