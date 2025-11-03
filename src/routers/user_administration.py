@@ -195,8 +195,19 @@ async def crear_usuario(usuario: Usuario):
 
         usuario_id = nuevo.data[0]["id"]
 
-        # Si tiene especialidad, agregar a especialidades_doctor
-        if usuario.especialidad_id and usuario.especialidad_id != "":
+        # Si tiene especialidades (múltiples), agregar a especialidades_doctor
+        if usuario.especialidades_ids and len(usuario.especialidades_ids) > 0:
+            # Insertar múltiples especialidades
+            especialidades_data = [
+                {
+                    "usuario_sistema_id": usuario_id,
+                    "especialidad_id": esp_id
+                }
+                for esp_id in usuario.especialidades_ids
+            ]
+            supabase_client.table("especialidades_doctor").insert(especialidades_data).execute()
+        elif usuario.especialidad_id and usuario.especialidad_id != "":
+            # Compatibilidad con especialidad única
             supabase_client.table("especialidades_doctor").insert({
                 "usuario_sistema_id": usuario_id,
                 "especialidad_id": int(usuario.especialidad_id)
@@ -265,22 +276,29 @@ async def modificar_usuario(usuario_id: int, usuario: Usuario):
         if not actualizado.data:
             raise HTTPException(status_code=500, detail="No se pudo actualizar el usuario.")
 
-        # Actualizar especialidad (en especialidades_doctor)
-        if usuario.especialidad_id and usuario.especialidad_id != "":
-            # Buscar si ya tiene registro
-            reg = supabase_client.table("especialidades_doctor").select("id").eq("usuario_sistema_id", usuario_id).execute()
-            if reg.data:
-                supabase_client.table("especialidades_doctor").update({
-                    "especialidad_id": int(usuario.especialidad_id)
-                }).eq("usuario_sistema_id", usuario_id).execute()
-            else:
-                supabase_client.table("especialidades_doctor").insert({
-                    "usuario_sistema_id": usuario_id,
-                    "especialidad_id": int(usuario.especialidad_id)
-                }).execute()
-        else:
-            # Si no se envía especialidad, eliminar registro si existe
+        # Actualizar especialidades (en especialidades_doctor)
+        if usuario.especialidades_ids is not None:
+            # Primero eliminar todas las especialidades existentes
             supabase_client.table("especialidades_doctor").delete().eq("usuario_sistema_id", usuario_id).execute()
+            
+            # Luego insertar las nuevas especialidades
+            if len(usuario.especialidades_ids) > 0:
+                especialidades_data = [
+                    {
+                        "usuario_sistema_id": usuario_id,
+                        "especialidad_id": esp_id
+                    }
+                    for esp_id in usuario.especialidades_ids
+                ]
+                supabase_client.table("especialidades_doctor").insert(especialidades_data).execute()
+        elif usuario.especialidad_id and usuario.especialidad_id != "":
+            # Compatibilidad con especialidad única
+            # Eliminar todas y agregar solo una
+            supabase_client.table("especialidades_doctor").delete().eq("usuario_sistema_id", usuario_id).execute()
+            supabase_client.table("especialidades_doctor").insert({
+                "usuario_sistema_id": usuario_id,
+                "especialidad_id": int(usuario.especialidad_id)
+            }).execute()
 
         return {"mensaje": "Usuario modificado correctamente.", "usuario": actualizado.data[0]}
     except HTTPException:
@@ -328,8 +346,10 @@ async def eliminar_usuario(usuario_id: int):
 async def listar_usuarios():
     """
     Devuelve todos los usuarios existentes en la tabla 'usuario_sistema'.
+    Para doctores (rol_id=2), incluye su especialidad desde la tabla especialidades_doctor.
     """
     try:
+        # Obtener todos los usuarios
         res = (
             supabase_client
             .table("usuario_sistema")
@@ -339,7 +359,37 @@ async def listar_usuarios():
         )
         if not res.data:
             raise HTTPException(status_code=404, detail="No hay usuarios registrados.")
-        return {"usuarios": res.data}
+        
+        usuarios = res.data
+        
+        # Para cada usuario que sea doctor (rol_id=2), obtener TODAS sus especialidades
+        for usuario in usuarios:
+            if usuario.get("rol_id") == 2:
+                # Buscar TODAS las especialidades del doctor
+                especialidades_doctor = (
+                    supabase_client
+                    .table("especialidades_doctor")
+                    .select("especialidad_id, sub_especialidad_id")
+                    .eq("usuario_sistema_id", usuario["id"])
+                    .execute()
+                )
+                
+                if especialidades_doctor.data:
+                    # Guardar lista de IDs de especialidades
+                    usuario["especialidades_ids"] = [item["especialidad_id"] for item in especialidades_doctor.data]
+                    # Mantener compatibilidad: primera especialidad como principal
+                    usuario["especialidad_id"] = especialidades_doctor.data[0].get("especialidad_id")
+                    usuario["sub_especialidad_id"] = especialidades_doctor.data[0].get("sub_especialidad_id")
+                else:
+                    usuario["especialidades_ids"] = []
+                    usuario["especialidad_id"] = None
+                    usuario["sub_especialidad_id"] = None
+            else:
+                usuario["especialidades_ids"] = []
+                usuario["especialidad_id"] = None
+                usuario["sub_especialidad_id"] = None
+        
+        return {"usuarios": usuarios}
     except HTTPException:
         raise
     except Exception as e:

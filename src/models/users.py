@@ -11,7 +11,8 @@ class Usuario(BaseModel):
     cel_secundario: Optional[str] = None
     direccion: str
     rol_id: int
-    especialidad_id: Optional[str] = None
+    especialidad_id: Optional[str] = None  # Mantener para compatibilidad
+    especialidades_ids: Optional[List[int]] = None  # Nueva: múltiples especialidades
     contraseña_temporal: Optional[str] = None  # Nueva: para crear doctores con clave temporal
 
 class Rol(BaseModel):
