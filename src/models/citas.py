@@ -49,3 +49,12 @@ class ActualizarInformacionCita(BaseModel):
 class CambiarEstado(BaseModel):
     """Modelo para cambiar el estado de una cita"""
     estado: str = Field(..., description="Nuevo estado: Pendiente, Confirmada, En Consulta, Completada, Cancelada")
+
+
+class CrearPago(BaseModel):
+    """Modelo para procesar un pago de cita"""
+    cita_medica_id: int = Field(..., description="ID de la cita médica")
+    tipo_pago: str = Field(..., description="Método de pago: Efectivo, Tarjeta de Débito, Tarjeta de Crédito, Transferencia")
+    total: float = Field(..., description="Monto total del pago")
+    descuento_aseguradora: Optional[float] = Field(None, description="Porcentaje de descuento (0-100)")
+    detalle_descuento: Optional[str] = Field(None, description="Motivo del descuento si aplica")

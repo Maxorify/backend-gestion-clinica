@@ -22,9 +22,11 @@ CREATE TABLE public.cita_medica (
   fecha_atencion timestamp with time zone NOT NULL,
   paciente_id bigint NOT NULL,
   doctor_id bigint NOT NULL,
+  horario_id bigint,
   CONSTRAINT cita_medica_pkey PRIMARY KEY (id),
   CONSTRAINT cita_medica_paciente_id_fkey FOREIGN KEY (paciente_id) REFERENCES public.paciente(id),
-  CONSTRAINT cita_medica_doctor_id_fkey FOREIGN KEY (doctor_id) REFERENCES public.usuario_sistema(id)
+  CONSTRAINT cita_medica_doctor_id_fkey FOREIGN KEY (doctor_id) REFERENCES public.usuario_sistema(id),
+  CONSTRAINT cita_medica_horario_id_fkey FOREIGN KEY (horario_id) REFERENCES public.horarios_personal(id)
 );
 CREATE TABLE public.contraseñas (
   id bigint NOT NULL DEFAULT nextval('"contraseñas_id_seq"'::regclass),
@@ -54,12 +56,11 @@ CREATE TABLE public.detalle (
 CREATE TABLE public.diagnosticos (
   id bigint NOT NULL DEFAULT nextval('diagnosticos_id_seq'::regclass),
   nombre_enfermedad text NOT NULL,
-  descripcion_enfermedad text,
   CONSTRAINT diagnosticos_pkey PRIMARY KEY (id)
 );
 CREATE TABLE public.especialidad (
   id bigint NOT NULL DEFAULT nextval('especialidad_id_seq'::regclass),
-  nombre text NOT NULL,
+  nombre text NOT NULL UNIQUE,
   descripcion text,
   CONSTRAINT especialidad_pkey PRIMARY KEY (id)
 );

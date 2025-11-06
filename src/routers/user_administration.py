@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Query
 from src.models.users import Rol, Usuario
 from src.utils.supabase import supabase_client
 
-user_router = APIRouter(tags=["Funciones de roles"], prefix="/Roles")
+user_router = APIRouter(tags=["Gestión de Usuarios y Roles"], prefix="/Usuarios")
 
 @user_router.post("/crear-rol")
 async def crear_rol(rol: Rol):
@@ -394,6 +394,65 @@ async def listar_usuarios():
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))    
+
+
+@user_router.get("/obtener-usuario/{usuario_id}")
+async def obtener_usuario(usuario_id: int):
+    """
+    Devuelve la información de un usuario específico.
+    Para doctores (rol_id=2), incluye sus especialidades.
+    """
+    try:
+        # Obtener el usuario
+        res = (
+            supabase_client
+            .table("usuario_sistema")
+            .select("*")
+            .eq("id", usuario_id)
+            .execute()
+        )
+
+        if not res.data:
+            raise HTTPException(status_code=404, detail=f"No se encontró el usuario con ID {usuario_id}.")
+
+        usuario = res.data[0]
+
+        # Si es doctor (rol_id=2), obtener sus especialidades
+        if usuario.get("rol_id") == 2:
+            especialidades_doctor = (
+                supabase_client
+                .table("especialidades_doctor")
+                .select("especialidad_id, sub_especialidad_id")
+                .eq("usuario_sistema_id", usuario_id)
+                .execute()
+            )
+
+            if especialidades_doctor.data:
+                # Obtener detalles de cada especialidad
+                especialidades_detalle = []
+                for esp in especialidades_doctor.data:
+                    especialidad = (
+                        supabase_client
+                        .table("especialidad")
+                        .select("id, nombre, descripcion")
+                        .eq("id", esp["especialidad_id"])
+                        .execute()
+                    )
+                    if especialidad.data:
+                        especialidades_detalle.append(especialidad.data[0])
+
+                usuario["especialidades"] = especialidades_detalle
+            else:
+                usuario["especialidades"] = []
+        else:
+            usuario["especialidades"] = []
+
+        return usuario
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @user_router.get("/listar-roles")

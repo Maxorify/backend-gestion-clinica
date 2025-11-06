@@ -15,12 +15,23 @@ async def crear_especialidad(especialidad: Especialidad):
         if existe.data:
             raise HTTPException(status_code=409, detail=f"La especialidad '{especialidad.nombre}' ya existe.")
 
-        creado = supabase_client.table("especialidad").insert({
+        # Crear la especialidad
+        creado_esp = supabase_client.table("especialidad").insert({
             "nombre": especialidad.nombre,
             "descripcion": especialidad.descripcion
         }).execute()
-        if not creado.data:
+        if not creado_esp.data:
             raise HTTPException(status_code=500, detail="No se pudo insertar la especialidad.")
+
+        especialidad_id = creado_esp.data[0]["id"]
+
+        # Si se proporcionó un precio, crear el registro en costos_servicio
+        if especialidad.precio is not None and especialidad.precio > 0:
+            supabase_client.table("costos_servicio").insert({
+                "servicio": f"Consulta {especialidad.nombre}",
+                "precio": especialidad.precio,
+                "especialidad_id": especialidad_id
+            }).execute()
 
         lista = supabase_client.table("especialidad").select("id,nombre,descripcion").order("id").execute()
         return {"mensaje": f"Especialidad '{especialidad.nombre}' creada.", "especialidades": lista.data}
@@ -47,6 +58,24 @@ async def modificar_especialidad(especialidad_id: int, especialidad: Especialida
                .eq("id", especialidad_id).execute())
         if not act.data:
             raise HTTPException(status_code=500, detail="No se pudo actualizar la especialidad.")
+
+        # Actualizar o crear el precio en costos_servicio
+        if especialidad.precio is not None:
+            costo_existe = supabase_client.table("costos_servicio").select("id").eq("especialidad_id", especialidad_id).execute()
+
+            if costo_existe.data:
+                # Actualizar precio existente
+                supabase_client.table("costos_servicio").update({
+                    "servicio": f"Consulta {especialidad.nombre}",
+                    "precio": especialidad.precio
+                }).eq("especialidad_id", especialidad_id).execute()
+            else:
+                # Crear nuevo precio
+                supabase_client.table("costos_servicio").insert({
+                    "servicio": f"Consulta {especialidad.nombre}",
+                    "precio": especialidad.precio,
+                    "especialidad_id": especialidad_id
+                }).execute()
 
         return {"mensaje": f"Especialidad '{especialidad.nombre}' modificada.", "especialidad": act.data[0]}
     except HTTPException:
@@ -234,7 +263,7 @@ async def listar_subespecialidades_de_especialidad(especialidad_id: int):
 @doctor_router.get("/especialidades")
 async def listar_especialidades():
     """
-    Devuelve todas las especialidades.
+    Devuelve todas las especialidades con sus precios.
     """
     try:
         res = (
@@ -244,7 +273,15 @@ async def listar_especialidades():
             .order("id", desc=False)
             .execute()
         )
-        return {"especialidades": res.data or []}
+
+        # Para cada especialidad, obtener el precio desde costos_servicio
+        especialidades_con_precio = []
+        for esp in (res.data or []):
+            costo = supabase_client.table("costos_servicio").select("precio").eq("especialidad_id", esp["id"]).execute()
+            esp["precio"] = costo.data[0]["precio"] if costo.data else None
+            especialidades_con_precio.append(esp)
+
+        return {"especialidades": especialidades_con_precio}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

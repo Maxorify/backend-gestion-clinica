@@ -22,6 +22,7 @@ class Rol(BaseModel):
 class Especialidad(BaseModel):
     nombre: str
     descripcion: str
+    precio: Optional[float] = None
 
 
 class SubEspecialidad(BaseModel):
