@@ -162,6 +162,12 @@ async def login(credentials: LoginRequest):
         auth_token = secrets.token_urlsafe(32)
 
         # 7. Construir respuesta con los datos del usuario
+        # Verificar si tiene contraseña temporal (contraseña es null y contraseña_temporal no es null)
+        tiene_contrasena_temporal = (
+            stored_password.get("contraseña") is None and
+            stored_password.get("contraseña_temporal") is not None
+        )
+
         user_data = {
             "id": user_info["id"],
             "nombre": user_info["nombre"],
@@ -173,7 +179,8 @@ async def login(credentials: LoginRequest):
             "rol_nombre": rol_normalizado,  # Usar el rol normalizado
             "especialidad_id": especialidad_id,
             "especialidad_nombre": especialidad_nombre,
-            "auth_token": auth_token
+            "auth_token": auth_token,
+            "contrasena_temporal": tiene_contrasena_temporal
         }
 
         return LoginResponse(
@@ -189,6 +196,66 @@ async def login(credentials: LoginRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error en el proceso de autenticación: {str(e)}"
+        )
+
+
+@auth_router.put("/cambiar-contrasena-temporal")
+async def cambiar_contrasena_temporal(data: dict):
+    """
+    Endpoint para cambiar la contraseña temporal por una definitiva
+    """
+    try:
+        usuario_id = data.get("usuario_id")
+        nueva_contrasena = data.get("nueva_contrasena")
+
+        if not usuario_id or not nueva_contrasena:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Se requiere usuario_id y nueva_contrasena"
+            )
+
+        # Validar longitud mínima
+        if len(nueva_contrasena) < 8:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La contraseña debe tener al menos 8 caracteres"
+            )
+
+        # Hashear la nueva contraseña
+        hashed_password = bcrypt.hashpw(
+            nueva_contrasena.encode('utf-8'),
+            bcrypt.gensalt()
+        ).decode('utf-8')
+
+        # Actualizar en la base de datos: establecer contraseña y eliminar contraseña temporal
+        update_result = (
+            supabase_client
+            .table("contraseñas")
+            .update({
+                "contraseña": hashed_password,
+                "contraseña_temporal": None
+            })
+            .eq("id_profesional_salud", usuario_id)
+            .execute()
+        )
+
+        if not update_result.data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Usuario no encontrado"
+            )
+
+        return {
+            "success": True,
+            "message": "Contraseña actualizada correctamente"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al cambiar contraseña: {str(e)}"
         )
 
 
