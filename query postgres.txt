@@ -23,10 +23,12 @@ CREATE TABLE public.cita_medica (
   paciente_id bigint NOT NULL,
   doctor_id bigint NOT NULL,
   horario_id bigint,
+  especialidad_id bigint,
   CONSTRAINT cita_medica_pkey PRIMARY KEY (id),
   CONSTRAINT cita_medica_paciente_id_fkey FOREIGN KEY (paciente_id) REFERENCES public.paciente(id),
   CONSTRAINT cita_medica_doctor_id_fkey FOREIGN KEY (doctor_id) REFERENCES public.usuario_sistema(id),
-  CONSTRAINT cita_medica_horario_id_fkey FOREIGN KEY (horario_id) REFERENCES public.horarios_personal(id)
+  CONSTRAINT cita_medica_horario_id_fkey FOREIGN KEY (horario_id) REFERENCES public.horarios_personal(id),
+  CONSTRAINT cita_medica_especialidad_id_fkey FOREIGN KEY (especialidad_id) REFERENCES public.especialidad(id)
 );
 CREATE TABLE public.contraseñas (
   id bigint NOT NULL DEFAULT nextval('"contraseñas_id_seq"'::regclass),

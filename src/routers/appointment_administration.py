@@ -113,7 +113,8 @@ async def crear_cita(cita_completa: CrearCitaCompleta):
             .insert({
                 "fecha_atencion": fecha_cita.isoformat(),
                 "paciente_id": cita_completa.cita.paciente_id,
-                "doctor_id": cita_completa.cita.doctor_id
+                "doctor_id": cita_completa.cita.doctor_id,
+                "especialidad_id": cita_completa.cita.especialidad_id
             })
             .execute()
         )
@@ -179,20 +180,23 @@ async def crear_cita(cita_completa: CrearCitaCompleta):
 async def listar_citas(
     fecha: Optional[str] = None,
     doctor_id: Optional[int] = None,
+    paciente_id: Optional[int] = None,
     estado: Optional[str] = None
 ):
     """
-    Lista todas las citas con información del paciente y doctor.
-    Filtros opcionales: fecha, doctor_id, estado.
+    Lista todas las citas con información del paciente, doctor y especialidad.
+    Filtros opcionales: fecha, doctor_id, paciente_id, estado.
     """
     try:
-        # Obtener todas las citas con joins
+        # Obtener todas las citas con especialidad_id incluido
         query = (
             supabase_client
             .table("cita_medica")
             .select("""
                 id,
                 fecha_atencion,
+                doctor_id,
+                especialidad_id,
                 paciente:paciente_id(id, nombre, apellido_paterno, apellido_materno, telefono, rut),
                 doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno)
             """)
@@ -203,13 +207,15 @@ async def listar_citas(
             query = query.gte("fecha_atencion", f"{fecha}T00:00:00").lte("fecha_atencion", f"{fecha}T23:59:59")
         if doctor_id:
             query = query.eq("doctor_id", doctor_id)
+        if paciente_id:
+            query = query.eq("paciente_id", paciente_id)
 
         citas = query.order("fecha_atencion", desc=False).execute()
 
         if not citas.data:
             return {"citas": []}
 
-        # Para cada cita, obtener el estado actual (último registro)
+        # Para cada cita, obtener el estado actual, especialidad y precio
         citas_con_estado = []
         for cita in citas.data:
             estado_actual = (
@@ -228,14 +234,81 @@ async def listar_citas(
             if estado and estado_texto != estado:
                 continue
 
+            # Obtener la especialidad de la cita (ya no del doctor)
+            especialidad_info = None
+            precio_especialidad = None
+            
+            if cita.get("especialidad_id"):
+                try:
+                    # Obtener información de la especialidad directamente
+                    especialidad_data = (
+                        supabase_client
+                        .table("especialidad")
+                        .select("id, nombre")
+                        .eq("id", cita["especialidad_id"])
+                        .limit(1)
+                        .execute()
+                    )
+                    
+                    if especialidad_data.data:
+                        especialidad_info = especialidad_data.data[0]
+                        
+                        # Obtener precio de la especialidad
+                        precio_data = (
+                            supabase_client
+                            .table("costos_servicio")
+                            .select("precio")
+                            .eq("especialidad_id", cita["especialidad_id"])
+                            .limit(1)
+                            .execute()
+                        )
+                        if precio_data.data:
+                            precio_especialidad = precio_data.data[0]["precio"]
+                except Exception as esp_error:
+                    print(f"Error al obtener especialidad para cita {cita['id']}: {str(esp_error)}")
+            else:
+                # Fallback: si la cita no tiene especialidad_id, usar la primera del doctor
+                try:
+                    especialidad_doctor = (
+                        supabase_client
+                        .table("especialidades_doctor")
+                        .select("especialidad_id, especialidad:especialidad_id(id, nombre)")
+                        .eq("usuario_sistema_id", cita["doctor_id"])
+                        .limit(1)
+                        .execute()
+                    )
+                    
+                    if especialidad_doctor.data and especialidad_doctor.data[0].get("especialidad"):
+                        especialidad_info = especialidad_doctor.data[0]["especialidad"]
+                        especialidad_id = especialidad_doctor.data[0]["especialidad_id"]
+                        
+                        # Obtener precio de la especialidad
+                        precio_data = (
+                            supabase_client
+                            .table("costos_servicio")
+                            .select("precio")
+                            .eq("especialidad_id", especialidad_id)
+                            .limit(1)
+                            .execute()
+                        )
+                        if precio_data.data:
+                            precio_especialidad = precio_data.data[0]["precio"]
+                except Exception as esp_error:
+                    print(f"Error al obtener especialidad del doctor para cita {cita['id']}: {str(esp_error)}")
+
             citas_con_estado.append({
                 **cita,
-                "estado_actual": estado_texto
+                "estado_actual": estado_texto,
+                "especialidad": especialidad_info,
+                "precio_especialidad": precio_especialidad
             })
 
         return {"citas": citas_con_estado}
 
     except Exception as e:
+        import traceback
+        print(f"ERROR en listar_citas: {str(e)}")
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -826,6 +899,122 @@ async def procesar_pago(pago: CrearPago):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@appointment_router.get("/listar-pagos")
+async def listar_pagos():
+    """
+    Lista todos los pagos procesados con información completa de paciente, doctor, especialidad y cita.
+    """
+    try:
+        # Obtener todos los pagos
+        pagos_response = (
+            supabase_client
+            .table("pagos")
+            .select("*, cita_medica_id")
+            .order("fecha_pago", desc=True)
+            .execute()
+        )
+
+        if not pagos_response.data:
+            return {"pagos": []}
+
+        pagos_completos = []
+
+        for pago in pagos_response.data:
+            # Obtener información de la cita
+            cita_response = (
+                supabase_client
+                .table("cita_medica")
+                .select("id, paciente_id, doctor_id, horario_id, especialidad_id, fecha_atencion")
+                .eq("id", pago["cita_medica_id"])
+                .single()
+                .execute()
+            )
+
+            if not cita_response.data:
+                continue
+
+            cita = cita_response.data
+
+            # Obtener información del paciente
+            paciente_response = (
+                supabase_client
+                .table("paciente")
+                .select("id, nombre, apellido_paterno, apellido_materno, rut, telefono, correo")
+                .eq("id", cita["paciente_id"])
+                .single()
+                .execute()
+            )
+
+            # Obtener información del doctor
+            doctor_response = (
+                supabase_client
+                .table("usuario_sistema")
+                .select("id, nombre, apellido_paterno, apellido_materno")
+                .eq("id", cita["doctor_id"])
+                .single()
+                .execute()
+            )
+
+            # Obtener especialidad de la cita
+            especialidad = None
+            if cita.get("especialidad_id"):
+                try:
+                    especialidad_response = (
+                        supabase_client
+                        .table("especialidad")
+                        .select("id, nombre")
+                        .eq("id", cita["especialidad_id"])
+                        .single()
+                        .execute()
+                    )
+                    if especialidad_response.data:
+                        especialidad = especialidad_response.data
+                except:
+                    pass
+
+            # Si no hay especialidad en la cita, obtener la primera del doctor
+            if not especialidad:
+                try:
+                    doctor_esp_response = (
+                        supabase_client
+                        .table("especialidades_doctor")
+                        .select("especialidad_id")
+                        .eq("usuario_sistema_id", cita["doctor_id"])
+                        .limit(1)
+                        .execute()
+                    )
+                    
+                    if doctor_esp_response.data:
+                        esp_id = doctor_esp_response.data[0]["especialidad_id"]
+                        especialidad_response = (
+                            supabase_client
+                            .table("especialidad")
+                            .select("id, nombre")
+                            .eq("id", esp_id)
+                            .single()
+                            .execute()
+                        )
+                        if especialidad_response.data:
+                            especialidad = especialidad_response.data
+                except:
+                    pass
+
+            if paciente_response.data and doctor_response.data:
+                pagos_completos.append({
+                    "pago": pago,
+                    "cita_id": cita["id"],
+                    "fecha_atencion": cita["fecha_atencion"],
+                    "paciente": paciente_response.data,
+                    "doctor": doctor_response.data,
+                    "especialidad": especialidad
+                })
+
+        return {"pagos": pagos_completos}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al listar pagos: {str(e)}")
+
+
 @appointment_router.get("/ingresos")
 async def obtener_ingresos(fecha: Optional[str] = None):
     """
@@ -1198,6 +1387,117 @@ async def obtener_detalle_completo_cita(cita_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@appointment_router.get("/paciente/{paciente_id}/historial-medico")
+async def obtener_historial_medico(paciente_id: int):
+    """
+    Obtiene el historial médico completo de un paciente.
+    Retorna todas las consultas completadas con su información detallada.
+    """
+    try:
+        # Obtener todas las citas del paciente ordenadas por fecha (más reciente primero)
+        citas_response = (
+            supabase_client
+            .table("cita_medica")
+            .select("""
+                id,
+                fecha_atencion,
+                doctor_id,
+                especialidad_id,
+                doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno),
+                especialidad:especialidad_id(id, nombre)
+            """)
+            .eq("paciente_id", paciente_id)
+            .order("fecha_atencion", desc=True)
+            .execute()
+        )
+
+        if not citas_response.data:
+            return {"historial": []}
+
+        historial = []
+
+        for cita in citas_response.data:
+            # Obtener estado actual de la cita
+            estado_response = (
+                supabase_client
+                .table("estado")
+                .select("estado")
+                .eq("cita_medica_id", cita["id"])
+                .order("id", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            estado_actual = estado_response.data[0]["estado"] if estado_response.data else "Sin estado"
+
+            # Solo incluir citas completadas en el historial
+            if estado_actual != "Completada":
+                continue
+
+            # Obtener información de la consulta
+            info_consulta_response = (
+                supabase_client
+                .table("informacion_cita")
+                .select("*")
+                .eq("cita_medica_id", cita["id"])
+                .execute()
+            )
+
+            info_consulta = None
+            diagnostico = None
+            recetas = []
+
+            if info_consulta_response.data:
+                info_consulta = info_consulta_response.data[0]
+
+                # Obtener diagnóstico si existe
+                if info_consulta.get("diagnostico_id"):
+                    diagnostico_response = (
+                        supabase_client
+                        .table("diagnosticos")
+                        .select("id, nombre_enfermedad")
+                        .eq("id", info_consulta["diagnostico_id"])
+                        .execute()
+                    )
+                    if diagnostico_response.data:
+                        diagnostico = diagnostico_response.data[0]
+
+                # Obtener recetas
+                recetas_response = (
+                    supabase_client
+                    .table("receta")
+                    .select("*")
+                    .eq("informacion_cita_id", info_consulta["id"])
+                    .execute()
+                )
+                recetas = recetas_response.data if recetas_response.data else []
+
+            # Construir objeto de consulta
+            consulta_data = {
+                "cita_id": cita["id"],
+                "fecha_atencion": cita["fecha_atencion"],
+                "doctor": cita.get("doctor"),
+                "especialidad": cita.get("especialidad"),
+                "informacion_consulta": {
+                    "motivo_consulta": info_consulta.get("motivo_consulta") if info_consulta else None,
+                    "antecedentes": info_consulta.get("antecedentes") if info_consulta else None,
+                    "dolores_sintomas": info_consulta.get("dolores_sintomas") if info_consulta else None,
+                    "atenciones_quirurgicas": info_consulta.get("atenciones_quirurgicas") if info_consulta else None,
+                    "evaluacion_doctor": info_consulta.get("evaluacion_doctor") if info_consulta else None,
+                    "tratamiento": info_consulta.get("tratamiento") if info_consulta else None,
+                    "diagnostico": diagnostico
+                },
+                "recetas": recetas
+            }
+
+            historial.append(consulta_data)
+
+        return {"historial": historial}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @appointment_router.put("/cita/{cita_id}/guardar-consulta")
 async def guardar_consulta(cita_id: int, consulta: GuardarConsulta):
     """
@@ -1364,5 +1664,87 @@ async def obtener_cita_en_consulta(doctor_id: int):
 
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@appointment_router.get("/doctor/{doctor_id}/pacientes-atendidos")
+async def obtener_pacientes_atendidos(doctor_id: int):
+    """
+    Obtiene la lista de pacientes únicos que un doctor ha atendido (consultas completadas).
+    Retorna información básica del paciente y la fecha de última atención.
+    """
+    try:
+        # Obtener todas las citas completadas del doctor
+        citas_response = (
+            supabase_client
+            .table("cita_medica")
+            .select("""
+                id,
+                fecha_atencion,
+                paciente_id,
+                paciente:paciente_id(id, nombre, apellido_paterno, apellido_materno, rut, fecha_nacimiento)
+            """)
+            .eq("doctor_id", doctor_id)
+            .order("fecha_atencion", desc=True)
+            .execute()
+        )
+
+        if not citas_response.data:
+            return {"pacientes": []}
+
+        # Diccionario para almacenar pacientes únicos con su última consulta
+        pacientes_map = {}
+
+        for cita in citas_response.data:
+            # Verificar que la cita esté completada
+            estado_response = (
+                supabase_client
+                .table("estado")
+                .select("estado")
+                .eq("cita_medica_id", cita["id"])
+                .order("id", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            if not estado_response.data or estado_response.data[0]["estado"] != "Completada":
+                continue
+
+            paciente = cita.get("paciente")
+            if not paciente:
+                continue
+
+            paciente_id = paciente["id"]
+
+            # Si el paciente no está en el map o esta cita es más reciente, actualizar
+            if paciente_id not in pacientes_map:
+                # Calcular edad
+                edad = None
+                if paciente.get("fecha_nacimiento"):
+                    try:
+                        fecha_nac = datetime.strptime(str(paciente["fecha_nacimiento"]), "%Y-%m-%d")
+                        hoy = datetime.now()
+                        edad = hoy.year - fecha_nac.year - ((hoy.month, hoy.day) < (fecha_nac.month, fecha_nac.day))
+                    except:
+                        edad = None
+
+                pacientes_map[paciente_id] = {
+                    "id": paciente["id"],
+                    "nombre": paciente.get("nombre", ""),
+                    "apellido_paterno": paciente.get("apellido_paterno", ""),
+                    "apellido_materno": paciente.get("apellido_materno", ""),
+                    "nombre_completo": f"{paciente.get('nombre', '')} {paciente.get('apellido_paterno', '')} {paciente.get('apellido_materno', '')}".strip(),
+                    "rut": paciente.get("rut", ""),
+                    "edad": edad,
+                    "ultima_atencion": cita["fecha_atencion"]
+                }
+
+        # Convertir a lista y ordenar por última atención (más reciente primero)
+        pacientes_list = list(pacientes_map.values())
+        pacientes_list.sort(key=lambda x: x["ultima_atencion"], reverse=True)
+
+        return {"pacientes": pacientes_list}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

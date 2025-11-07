@@ -393,8 +393,113 @@ async def listar_usuarios():
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))    
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+@user_router.get("/listar-doctores-paginado")
+async def listar_doctores_paginado(
+    page: int = Query(1, ge=1, description="Número de página (comienza en 1)"),
+    page_size: int = Query(6, ge=1, le=50, description="Cantidad de doctores por página (máximo 50)"),
+    search: str = Query(None, description="Búsqueda por nombre, apellido o RUT")
+):
+    """
+    Devuelve doctores (rol_id=2) de forma paginada con sus especialidades.
+    Optimizado para no saturar la base de datos.
+    """
+    try:
+        # Calcular offset para la paginación
+        offset = (page - 1) * page_size
+        
+        # Construir query base para doctores
+        query = (
+            supabase_client
+            .table("usuario_sistema")
+            .select("*", count="exact")
+            .eq("rol_id", 2)
+        )
+        
+        # Aplicar búsqueda si existe
+        if search:
+            # Usar múltiples .ilike() en lugar de .or_() para compatibilidad
+            query = query.or_(
+                f"nombre.ilike.%{search}%,"
+                f"apellido_paterno.ilike.%{search}%,"
+                f"apellido_materno.ilike.%{search}%,"
+                f"rut.ilike.%{search}%"
+            )
+        
+        # Aplicar paginación y ordenar
+        res = (
+            query
+            .order("id", desc=False)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        
+        if not res.data:
+            return {
+                "doctores": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": 0
+            }
+        
+        doctores = res.data
+        total_count = res.count if hasattr(res, 'count') else len(doctores)
+        
+        # Para cada doctor, obtener TODAS sus especialidades
+        for doctor in doctores:
+            try:
+                especialidades_doctor = (
+                    supabase_client
+                    .table("especialidades_doctor")
+                    .select("especialidad_id, sub_especialidad_id, especialidad(id, nombre)")
+                    .eq("usuario_sistema_id", doctor["id"])
+                    .execute()
+                )
+                
+                if especialidades_doctor.data:
+                    # Guardar lista completa de especialidades con nombres
+                    doctor["especialidades"] = [
+                        {
+                            "id": item["especialidad_id"],
+                            "nombre": item["especialidad"]["nombre"] if item.get("especialidad") else "Sin nombre"
+                        }
+                        for item in especialidades_doctor.data
+                    ]
+                    doctor["especialidades_ids"] = [item["especialidad_id"] for item in especialidades_doctor.data]
+                    # Mantener compatibilidad
+                    doctor["especialidad_id"] = especialidades_doctor.data[0].get("especialidad_id")
+                    doctor["sub_especialidad_id"] = especialidades_doctor.data[0].get("sub_especialidad_id")
+                else:
+                    doctor["especialidades"] = []
+                    doctor["especialidades_ids"] = []
+                    doctor["especialidad_id"] = None
+                    doctor["sub_especialidad_id"] = None
+            except Exception as esp_error:
+                print(f"Error al cargar especialidades del doctor {doctor['id']}: {str(esp_error)}")
+                doctor["especialidades"] = []
+                doctor["especialidades_ids"] = []
+                doctor["especialidad_id"] = None
+                doctor["sub_especialidad_id"] = None
+        
+        # Calcular total de páginas
+        total_pages = (total_count + page_size - 1) // page_size
+        
+        return {
+            "doctores": doctores,
+            "total": total_count,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages
+        }
+    except Exception as e:
+        import traceback
+        print(f"ERROR en listar_doctores_paginado: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error al listar doctores: {str(e)}")
+    
 
 @user_router.get("/obtener-usuario/{usuario_id}")
 async def obtener_usuario(usuario_id: int):
@@ -529,3 +634,149 @@ async def generar_clave_temporal(usuario_id: int, contraseña_temporal: str = Qu
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@user_router.get("/usuario/{usuario_id}")
+async def obtener_datos_usuario(usuario_id: int):
+    """
+    Obtiene los datos del usuario para su perfil personal.
+    """
+    try:
+        usuario = (
+            supabase_client
+            .table("usuario_sistema")
+            .select("id, nombre, apellido_paterno, apellido_materno, rut, email, celular, cel_secundario, direccion")
+            .eq("id", usuario_id)
+            .single()
+            .execute()
+        )
+
+        if not usuario.data:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        return usuario.data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al obtener usuario: {str(e)}")
+
+
+@user_router.put("/actualizar-usuario/{usuario_id}")
+async def actualizar_usuario(usuario_id: int, datos: dict):
+    """
+    Actualiza los datos personales del usuario.
+    """
+    try:
+        # Campos permitidos para actualización
+        campos_permitidos = {
+            "nombre", "apellido_paterno", "apellido_materno", 
+            "rut", "email", "celular", "cel_secundario", "direccion"
+        }
+        
+        # Filtrar solo los campos permitidos
+        datos_actualizar = {k: v for k, v in datos.items() if k in campos_permitidos}
+        
+        if not datos_actualizar:
+            raise HTTPException(status_code=400, detail="No hay datos válidos para actualizar")
+
+        # Verificar que el usuario existe
+        usuario = (
+            supabase_client
+            .table("usuario_sistema")
+            .select("id")
+            .eq("id", usuario_id)
+            .single()
+            .execute()
+        )
+
+        if not usuario.data:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        # Si se está actualizando el email, verificar que no esté en uso
+        if "email" in datos_actualizar and datos_actualizar["email"]:
+            email_existe = (
+                supabase_client
+                .table("usuario_sistema")
+                .select("id")
+                .eq("email", datos_actualizar["email"])
+                .neq("id", usuario_id)
+                .execute()
+            )
+            if email_existe.data:
+                raise HTTPException(status_code=409, detail="El email ya está en uso")
+
+        # Actualizar el usuario
+        supabase_client.table("usuario_sistema").update(
+            datos_actualizar
+        ).eq("id", usuario_id).execute()
+
+        return {"mensaje": "Usuario actualizado correctamente"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al actualizar usuario: {str(e)}")
+
+
+@user_router.put("/cambiar-password/{usuario_id}")
+async def cambiar_password(usuario_id: int, datos: dict):
+    """
+    Cambia la contraseña del usuario.
+    Requiere la contraseña actual y la nueva contraseña.
+    """
+    try:
+        password_actual = datos.get("password_actual")
+        password_nueva = datos.get("password_nueva")
+
+        if not password_actual or not password_nueva:
+            raise HTTPException(
+                status_code=400, 
+                detail="Se requiere la contraseña actual y la nueva contraseña"
+            )
+
+        # Verificar que el usuario existe
+        usuario = (
+            supabase_client
+            .table("usuario_sistema")
+            .select("id")
+            .eq("id", usuario_id)
+            .single()
+            .execute()
+        )
+
+        if not usuario.data:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+        # Obtener el registro de contraseñas
+        registro_password = (
+            supabase_client
+            .table("contraseñas")
+            .select("id, contraseña")
+            .eq("id_profesional_salud", usuario_id)
+            .single()
+            .execute()
+        )
+
+        if not registro_password.data:
+            raise HTTPException(
+                status_code=404, 
+                detail="No se encontró registro de contraseña para este usuario"
+            )
+
+        # Verificar que la contraseña actual coincide
+        if registro_password.data["contraseña"] != password_actual:
+            raise HTTPException(status_code=401, detail="Contraseña actual incorrecta")
+
+        # Actualizar la contraseña
+        supabase_client.table("contraseñas").update({
+            "contraseña": password_nueva,
+            "contraseña_temporal": None  # Limpiar contraseña temporal si existe
+        }).eq("id_profesional_salud", usuario_id).execute()
+
+        return {"mensaje": "Contraseña cambiada correctamente"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al cambiar contraseña: {str(e)}")
