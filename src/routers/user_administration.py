@@ -310,33 +310,37 @@ async def modificar_usuario(usuario_id: int, usuario: Usuario):
 @user_router.delete("/eliminar-usuario/{usuario_id}")
 async def eliminar_usuario(usuario_id: int):
     """
-    Elimina un usuario por su ID. Elimina también su especialidad si existe.
+    Desactiva un usuario (soft delete) cambiando su estado a inactivo.
+    El usuario y sus relaciones se mantienen en la base de datos pero no aparecerán en listados.
     """
     try:
         existe = (
             supabase_client
             .table("usuario_sistema")
-            .select("id")
+            .select("id, nombre, apellido_paterno, activo")
             .eq("id", usuario_id)
             .execute()
         )
         if not existe.data:
             raise HTTPException(status_code=404, detail="No existe el usuario.")
 
-        # Eliminar especialidad si existe
-        supabase_client.table("especialidades_doctor").delete().eq("usuario_sistema_id", usuario_id).execute()
+        usuario = existe.data[0]
+        if not usuario.get("activo", True):
+            raise HTTPException(status_code=400, detail="El usuario ya está inactivo.")
 
-        eliminado = (
+        # Soft delete: marcar como inactivo en lugar de eliminar
+        actualizado = (
             supabase_client
             .table("usuario_sistema")
-            .delete()
+            .update({"activo": False})
             .eq("id", usuario_id)
             .execute()
         )
-        if not eliminado.data:
-            raise HTTPException(status_code=500, detail="No se pudo eliminar el usuario.")
+        if not actualizado.data:
+            raise HTTPException(status_code=500, detail="No se pudo desactivar el usuario.")
 
-        return {"mensaje": "Usuario eliminado correctamente."}
+        nombre_completo = f"{usuario.get('nombre', '')} {usuario.get('apellido_paterno', '')}".strip()
+        return {"mensaje": f"Usuario {nombre_completo} desactivado correctamente."}
     except HTTPException:
         raise
     except Exception as e:
@@ -578,6 +582,50 @@ async def listar_roles():
             raise HTTPException(status_code=404, detail="No hay roles registrados.")
 
         return {"roles": res.data}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@user_router.get("/obtener-clave-temporal/{usuario_id}")
+async def obtener_clave_temporal(usuario_id: int):
+    """
+    Obtiene la contraseña temporal de un usuario si existe.
+    """
+    try:
+        # Verificar que el usuario existe
+        usuario = (
+            supabase_client
+            .table("usuario_sistema")
+            .select("id, rol_id")
+            .eq("id", usuario_id)
+            .execute()
+        )
+
+        if not usuario.data:
+            raise HTTPException(status_code=404, detail="No existe el usuario.")
+
+        # Buscar registro de contraseña
+        registro_password = (
+            supabase_client
+            .table("contraseñas")
+            .select("contraseña_temporal")
+            .eq("id_profesional_salud", usuario_id)
+            .execute()
+        )
+
+        if registro_password.data and registro_password.data[0].get("contraseña_temporal"):
+            return {
+                "tiene_clave": True,
+                "contraseña_temporal": registro_password.data[0]["contraseña_temporal"]
+            }
+        else:
+            return {
+                "tiene_clave": False,
+                "contraseña_temporal": None
+            }
 
     except HTTPException:
         raise
