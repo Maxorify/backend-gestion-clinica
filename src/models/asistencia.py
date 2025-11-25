@@ -123,6 +123,8 @@ class DoctorBasicInfo(BaseModel):
     nombre_completo: str
     rut: Optional[str]
     especialidades: List[str] = []
+    email: Optional[str] = None
+    celular: Optional[str] = None
 
 
 class EstadoAsistenciaResponse(BaseModel):

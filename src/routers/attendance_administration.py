@@ -30,7 +30,7 @@ async def obtener_turnos_dia(
     try:
         # 1. Obtener horarios del día desde horarios_personal
         horarios_response = supabase_client.from_("horarios_personal") \
-            .select("*, usuario:usuario_sistema_id(id, nombre, apellido_paterno, apellido_materno, rut)") \
+            .select("*, usuario:usuario_sistema_id(id, nombre, apellido_paterno, apellido_materno, rut, email, celular)") \
             .gte("inicio_bloque", f"{fecha_consulta}T00:00:00") \
             .lte("inicio_bloque", f"{fecha_consulta}T23:59:59") \
             .order("inicio_bloque", desc=False) \
@@ -77,14 +77,27 @@ async def obtener_turnos_dia(
             doctor_data = info['doctor']
             
             # Buscar si existe registro de asistencia para este doctor hoy
+            # Buscamos asistencias que coincidan con el rango de horario programado
+            inicio_programado = datetime.fromisoformat(info['inicio_turno'].replace("Z", "+00:00"))
+            fin_programado = datetime.fromisoformat(info['finalizacion_turno'].replace("Z", "+00:00"))
+            
+            # Buscar asistencia en un rango amplio que incluya turnos que cruzan medianoche
             asist_response = supabase_client.from_("asistencia") \
                 .select("*") \
                 .eq("usuario_sistema_id", doctor_id) \
-                .gte("inicio_turno", f"{fecha_consulta}T00:00:00") \
-                .lte("inicio_turno", f"{fecha_consulta}T23:59:59") \
+                .gte("inicio_turno", (inicio_programado - timedelta(days=1)).isoformat()) \
+                .lte("inicio_turno", (fin_programado + timedelta(days=1)).isoformat()) \
                 .execute()
             
-            asistencia = asist_response.data[0] if asist_response.data else None
+            # Filtrar para encontrar la asistencia que corresponde a este turno
+            asistencia = None
+            if asist_response.data:
+                for asist in asist_response.data:
+                    inicio_asist = datetime.fromisoformat(asist['inicio_turno'].replace("Z", "+00:00"))
+                    # Verificar si la asistencia está dentro del rango del turno programado (con margen)
+                    if abs((inicio_asist - inicio_programado).total_seconds()) < 86400:  # Menos de 24h de diferencia
+                        asistencia = asist
+                        break
             
             # Obtener especialidades
             esp_response = supabase_client.from_("especialidades_doctor") \
@@ -104,7 +117,9 @@ async def obtener_turnos_dia(
                 apellido_materno=doctor_data.get("apellido_materno", ""),
                 nombre_completo=f"{doctor_data.get('nombre', '')} {doctor_data.get('apellido_paterno', '')} {doctor_data.get('apellido_materno', '')}".strip(),
                 rut=doctor_data.get("rut"),
-                especialidades=especialidades
+                especialidades=especialidades,
+                email=doctor_data.get("email"),
+                celular=doctor_data.get("celular")
             )
             
             # Contar pacientes
@@ -131,14 +146,24 @@ async def obtener_turnos_dia(
                 # Calcular minutos trabajados
                 if fin_real:
                     minutos_trabajados = int((fin_real - inicio_real).total_seconds() / 60)
-                    estado = "ASISTIO"
-                    stats["asistieron"] += 1
+                    # Si llegó con atraso, aunque haya completado el turno
+                    if minutos_atraso > 0:
+                        estado = "ATRASO"
+                        stats["con_atraso"] += 1
+                    else:
+                        estado = "ASISTIO"
+                        stats["asistieron"] += 1
                 else:
                     # Aún en turno
                     ahora = datetime.now(inicio_real.tzinfo)
                     minutos_trabajados = int((ahora - inicio_real).total_seconds() / 60)
-                    estado = "EN_TURNO"
-                    stats["en_turno"] += 1
+                    # Si llegó con atraso, aunque esté en turno
+                    if minutos_atraso > 0:
+                        estado = "ATRASO"
+                        stats["con_atraso"] += 1
+                    else:
+                        estado = "EN_TURNO"
+                        stats["en_turno"] += 1
                 
                 marca_entrada = inicio_real
                 marca_salida = fin_real
@@ -153,9 +178,9 @@ async def obtener_turnos_dia(
                     estado = "AUSENTE"
                     stats["ausentes"] += 1
                 elif ahora >= inicio_programado:
-                    # Ya debería haber iniciado pero no marcó entrada
-                    estado = "AUSENTE"
-                    stats["ausentes"] += 1
+                    # Ya debería haber iniciado pero no marcó entrada - está ATRASADO sin marcar
+                    estado = "ATRASADO"
+                    stats["con_atraso"] += 1
                 else:
                     # Aún no llega la hora - turno programado para después
                     estado = "PROGRAMADO"
