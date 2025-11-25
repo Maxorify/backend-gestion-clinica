@@ -715,18 +715,44 @@ async def listar_doctores(especialidad_id: Optional[int] = None):
 async def obtener_estadisticas(fecha: Optional[str] = None):
     """
     Obtiene estadísticas de citas (total, por estado).
-    Si se proporciona fecha, filtra por ese día.
+    Si se proporciona fecha, filtra por ese día usando zona horaria de Chile.
     """
     try:
-        # Obtener todas las citas
-        query = supabase_client.table("cita_medica").select("id")
-        
-        if fecha:
-            query = query.gte("fecha_atencion", f"{fecha}T00:00:00").lte("fecha_atencion", f"{fecha}T23:59:59")
-        
-        citas = query.execute()
+        from datetime import datetime
+        import pytz
 
-        if not citas.data:
+        # Si se proporciona fecha, usar zona horaria de Chile
+        if fecha:
+            tz_chile = pytz.timezone('America/Santiago')
+
+            # Obtener todas las citas sin filtro de fecha primero
+            todas_citas = (
+                supabase_client
+                .table("cita_medica")
+                .select("id, fecha_atencion")
+                .execute()
+            )
+
+            # Filtrar manualmente por fecha en zona horaria de Chile
+            citas_filtradas = []
+            for cita in (todas_citas.data or []):
+                try:
+                    fecha_cita = datetime.fromisoformat(cita['fecha_atencion'].replace('Z', '+00:00'))
+                    fecha_cita_chile = fecha_cita.astimezone(tz_chile)
+                    fecha_cita_str = fecha_cita_chile.date().isoformat()
+
+                    if fecha_cita_str == fecha:
+                        citas_filtradas.append(cita)
+                except:
+                    continue
+
+            citas_data = citas_filtradas
+        else:
+            # Sin filtro de fecha, obtener todas
+            resultado = supabase_client.table("cita_medica").select("id").execute()
+            citas_data = resultado.data or []
+
+        if not citas_data:
             return {
                 "total": 0,
                 "confirmadas": 0,
@@ -738,7 +764,7 @@ async def obtener_estadisticas(fecha: Optional[str] = None):
 
         # Contar por estado
         estadisticas = {
-            "total": len(citas.data),
+            "total": len(citas_data),
             "confirmadas": 0,
             "pendientes": 0,
             "en_consulta": 0,
@@ -746,7 +772,7 @@ async def obtener_estadisticas(fecha: Optional[str] = None):
             "canceladas": 0
         }
 
-        for cita in citas.data:
+        for cita in citas_data:
             # Obtener estado actual de cada cita
             estado = (
                 supabase_client
@@ -1745,6 +1771,330 @@ async def obtener_pacientes_atendidos(doctor_id: int):
         pacientes_list.sort(key=lambda x: x["ultima_atencion"], reverse=True)
 
         return {"pacientes": pacientes_list}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============== ENDPOINTS PARA SECRETARIA ==============
+
+@appointment_router.get("/hoy/pendientes")
+async def obtener_citas_pendientes_hoy():
+    """
+    Obtiene todas las citas del día actual en estado 'Pendiente'.
+    Retorna información de paciente, doctor, especialidad y hora.
+    """
+    try:
+        from datetime import datetime, date as date_module, timedelta
+        import pytz
+
+        # Obtener fecha actual en zona horaria de Chile
+        tz_chile = pytz.timezone('America/Santiago')
+        ahora_chile = datetime.now(tz_chile)
+        fecha_actual = ahora_chile.date().isoformat()
+
+        # Obtener todas las citas
+        citas_hoy = (
+            supabase_client
+            .table("cita_medica")
+            .select("""
+                id,
+                fecha_atencion,
+                paciente:paciente_id(id, nombre, apellido_paterno, apellido_materno, rut, telefono),
+                doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno),
+                especialidad:especialidad_id(id, nombre)
+            """)
+            .order("fecha_atencion", desc=False)
+            .execute()
+        )
+
+        if not citas_hoy.data:
+            return {"citas": []}
+
+        # Ahora filtrar por fecha del día actual
+        citas_pendientes = []
+
+        for cita in citas_hoy.data:
+            try:
+                # Parsear fecha y convertir a zona horaria de Chile
+                fecha_cita = datetime.fromisoformat(cita['fecha_atencion'].replace('Z', '+00:00'))
+                fecha_cita_chile = fecha_cita.astimezone(tz_chile)
+                fecha_cita_str = fecha_cita_chile.date().isoformat()
+
+                # Solo procesar citas del día actual
+                if fecha_cita_str != fecha_actual:
+                    continue
+
+                # Obtener estado actual
+                estado = (
+                    supabase_client
+                    .table("estado")
+                    .select("estado")
+                    .eq("cita_medica_id", cita["id"])
+                    .order("id", desc=True)
+                    .limit(1)
+                    .execute()
+                )
+
+                estado_texto = estado.data[0]["estado"] if estado.data else "Sin estado"
+
+                # Solo incluir si está en estado Pendiente
+                if estado_texto.lower() == "pendiente":
+                    citas_pendientes.append({
+                        **cita,
+                        "estado_actual": estado_texto
+                    })
+            except:
+                continue
+
+        return {"citas": citas_pendientes}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@appointment_router.get("/hoy/confirmadas")
+async def obtener_citas_confirmadas_hoy():
+    """
+    Obtiene todas las citas del día actual en estado 'Confirmada'.
+    Retorna información de paciente, doctor, especialidad y hora.
+    """
+    try:
+        from datetime import date as date_module
+
+        # Obtener fecha actual
+        fecha_actual = date_module.today().isoformat()
+
+        # Obtener todas las citas del día
+        citas_hoy = (
+            supabase_client
+            .table("cita_medica")
+            .select("""
+                id,
+                fecha_atencion,
+                paciente:paciente_id(id, nombre, apellido_paterno, apellido_materno, rut, telefono),
+                doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno),
+                especialidad:especialidad_id(id, nombre)
+            """)
+            .gte("fecha_atencion", f"{fecha_actual}T00:00:00")
+            .lte("fecha_atencion", f"{fecha_actual}T23:59:59")
+            .order("fecha_atencion", desc=False)
+            .execute()
+        )
+
+        if not citas_hoy.data:
+            return {"citas": []}
+
+        citas_confirmadas = []
+
+        for cita in citas_hoy.data:
+            # Obtener estado actual
+            estado = (
+                supabase_client
+                .table("estado")
+                .select("estado")
+                .eq("cita_medica_id", cita["id"])
+                .order("id", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            estado_texto = estado.data[0]["estado"] if estado.data else "Sin estado"
+
+            # Solo incluir si está en estado Confirmada (case-insensitive)
+            if estado_texto.lower() == "confirmada":
+                citas_confirmadas.append({
+                    **cita,
+                    "estado_actual": estado_texto
+                })
+
+        return {"citas": citas_confirmadas}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@appointment_router.get("/hoy/todas-estados")
+async def obtener_todas_citas_hoy():
+    """
+    Obtiene todas las citas del día actual con sus estados.
+    Útil para ver el panorama completo del día.
+    """
+    try:
+        from datetime import date as date_module
+
+        # Obtener fecha actual
+        fecha_actual = date_module.today().isoformat()
+
+        # Obtener todas las citas del día
+        citas_hoy = (
+            supabase_client
+            .table("cita_medica")
+            .select("""
+                id,
+                fecha_atencion,
+                paciente:paciente_id(id, nombre, apellido_paterno, apellido_materno, rut, telefono),
+                doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno),
+                especialidad:especialidad_id(id, nombre)
+            """)
+            .gte("fecha_atencion", f"{fecha_actual}T00:00:00")
+            .lte("fecha_atencion", f"{fecha_actual}T23:59:59")
+            .order("fecha_atencion", desc=False)
+            .execute()
+        )
+
+        if not citas_hoy.data:
+            return {"citas": []}
+
+        citas_con_estado = []
+
+        for cita in citas_hoy.data:
+            # Obtener estado actual
+            estado = (
+                supabase_client
+                .table("estado")
+                .select("estado")
+                .eq("cita_medica_id", cita["id"])
+                .order("id", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            estado_texto = estado.data[0]["estado"] if estado.data else "Sin estado"
+
+            citas_con_estado.append({
+                **cita,
+                "estado_actual": estado_texto
+            })
+
+        return {"citas": citas_con_estado}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@appointment_router.get("/actividad-reciente")
+async def obtener_actividad_reciente(fecha: Optional[str] = None):
+    """
+    Obtiene la actividad reciente del día (últimos pagos y últimas citas creadas).
+    Si se proporciona fecha, filtra por ese día usando zona horaria de Chile.
+    """
+    try:
+        from datetime import datetime, date as date_module
+        import pytz
+
+        # Zona horaria de Chile
+        tz_chile = pytz.timezone('America/Santiago')
+
+        # Usar fecha actual de Chile si no se proporciona
+        if not fecha:
+            ahora_chile = datetime.now(tz_chile)
+            fecha_filtro = ahora_chile.date().isoformat()
+        else:
+            fecha_filtro = fecha
+
+        # Obtener todos los pagos sin filtro de fecha
+        todos_pagos = (
+            supabase_client
+            .table("pagos")
+            .select("""
+                id,
+                fecha_pago,
+                tipo_pago,
+                total,
+                cita_medica_id
+            """)
+            .order("fecha_pago", desc=True)
+            .limit(100)
+            .execute()
+        )
+
+        # Filtrar pagos por fecha en zona horaria de Chile
+        pagos_del_dia = []
+        for pago in (todos_pagos.data or []):
+            try:
+                fecha_pago = datetime.fromisoformat(pago['fecha_pago'].replace('Z', '+00:00'))
+                fecha_pago_chile = fecha_pago.astimezone(tz_chile)
+
+                if fecha_pago_chile.date().isoformat() == fecha_filtro:
+                    pagos_del_dia.append(pago)
+            except:
+                continue
+
+        # Ordenar y limitar a 10
+        pagos_del_dia = sorted(pagos_del_dia, key=lambda x: x['fecha_pago'], reverse=True)[:10]
+
+        # Enriquecer con información de paciente
+        pagos_con_info = []
+        for pago in pagos_del_dia:
+            # Obtener info de la cita y paciente
+            cita = (
+                supabase_client
+                .table("cita_medica")
+                .select("paciente:paciente_id(nombre, apellido_paterno, apellido_materno)")
+                .eq("id", pago["cita_medica_id"])
+                .single()
+                .execute()
+            )
+
+            if cita.data:
+                pagos_con_info.append({
+                    **pago,
+                    "paciente": cita.data.get("paciente")
+                })
+
+        # Obtener todas las citas sin filtro de fecha
+        todas_citas = (
+            supabase_client
+            .table("cita_medica")
+            .select("""
+                id,
+                fecha_atencion,
+                paciente:paciente_id(id, nombre, apellido_paterno, apellido_materno),
+                doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno)
+            """)
+            .order("id", desc=True)
+            .limit(100)
+            .execute()
+        )
+
+        # Filtrar citas por fecha en zona horaria de Chile
+        citas_del_dia = []
+        for cita in (todas_citas.data or []):
+            try:
+                fecha_cita = datetime.fromisoformat(cita['fecha_atencion'].replace('Z', '+00:00'))
+                fecha_cita_chile = fecha_cita.astimezone(tz_chile)
+
+                if fecha_cita_chile.date().isoformat() == fecha_filtro:
+                    citas_del_dia.append(cita)
+            except:
+                continue
+
+        # Ordenar por ID descendente (más recientes primero) y limitar a 10
+        citas_del_dia = sorted(citas_del_dia, key=lambda x: x['id'], reverse=True)[:10]
+
+        # Agregar estado a las citas
+        citas_con_estado = []
+        for cita in citas_del_dia:
+            estado = (
+                supabase_client
+                .table("estado")
+                .select("estado")
+                .eq("cita_medica_id", cita["id"])
+                .order("id", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            citas_con_estado.append({
+                **cita,
+                "estado_actual": estado.data[0]["estado"] if estado.data else "Sin estado"
+            })
+
+        return {
+            "pagos_recientes": pagos_con_info,
+            "citas_recientes": citas_con_estado
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

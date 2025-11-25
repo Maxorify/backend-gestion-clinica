@@ -452,7 +452,7 @@ async def listar_doctores_paginado(
         doctores = res.data
         total_count = res.count if hasattr(res, 'count') else len(doctores)
         
-        # Para cada doctor, obtener TODAS sus especialidades
+        # Para cada doctor, obtener TODAS sus especialidades y contraseña temporal
         for doctor in doctores:
             try:
                 especialidades_doctor = (
@@ -462,7 +462,7 @@ async def listar_doctores_paginado(
                     .eq("usuario_sistema_id", doctor["id"])
                     .execute()
                 )
-                
+
                 if especialidades_doctor.data:
                     # Guardar lista completa de especialidades con nombres
                     doctor["especialidades"] = [
@@ -487,6 +487,24 @@ async def listar_doctores_paginado(
                 doctor["especialidades_ids"] = []
                 doctor["especialidad_id"] = None
                 doctor["sub_especialidad_id"] = None
+
+            # Obtener contraseña temporal desde la tabla contraseñas
+            try:
+                clave_response = (
+                    supabase_client
+                    .table("contraseñas")
+                    .select("contraseña_temporal")
+                    .eq("id_profesional_salud", doctor["id"])
+                    .execute()
+                )
+
+                if clave_response.data and len(clave_response.data) > 0:
+                    doctor["contraseña_temporal"] = clave_response.data[0].get("contraseña_temporal")
+                else:
+                    doctor["contraseña_temporal"] = None
+            except Exception as clave_error:
+                print(f"Error al cargar contraseña temporal del doctor {doctor['id']}: {str(clave_error)}")
+                doctor["contraseña_temporal"] = None
         
         # Calcular total de páginas
         total_pages = (total_count + page_size - 1) // page_size
