@@ -351,6 +351,7 @@ async def listar_usuarios():
     """
     Devuelve todos los usuarios existentes en la tabla 'usuario_sistema'.
     Para doctores (rol_id=2), incluye su especialidad desde la tabla especialidades_doctor.
+    OPTIMIZADO: Bulk query en lugar de N+1.
     """
     try:
         # Obtener todos los usuarios
@@ -366,24 +367,38 @@ async def listar_usuarios():
         
         usuarios = res.data
         
-        # Para cada usuario que sea doctor (rol_id=2), obtener TODAS sus especialidades
+        # OPTIMIZACIÓN: Obtener IDs de todos los doctores
+        doctor_ids = [u["id"] for u in usuarios if u.get("rol_id") == 2]
+        
+        # OPTIMIZACIÓN: Bulk query de especialidades de TODOS los doctores (1 query en lugar de N)
+        especialidades_dict = {}
+        if doctor_ids:
+            especialidades_response = (
+                supabase_client
+                .table("especialidades_doctor")
+                .select("usuario_sistema_id, especialidad_id, sub_especialidad_id")
+                .in_("usuario_sistema_id", doctor_ids)
+                .execute()
+            )
+            
+            # Agrupar especialidades por usuario_id
+            if especialidades_response.data:
+                for item in especialidades_response.data:
+                    usuario_id = item["usuario_sistema_id"]
+                    if usuario_id not in especialidades_dict:
+                        especialidades_dict[usuario_id] = []
+                    especialidades_dict[usuario_id].append(item)
+        
+        # Mapear especialidades usando lookups O(1)
         for usuario in usuarios:
             if usuario.get("rol_id") == 2:
-                # Buscar TODAS las especialidades del doctor
-                especialidades_doctor = (
-                    supabase_client
-                    .table("especialidades_doctor")
-                    .select("especialidad_id, sub_especialidad_id")
-                    .eq("usuario_sistema_id", usuario["id"])
-                    .execute()
-                )
+                especialidades_data = especialidades_dict.get(usuario["id"], [])
                 
-                if especialidades_doctor.data:
-                    # Guardar lista de IDs de especialidades
-                    usuario["especialidades_ids"] = [item["especialidad_id"] for item in especialidades_doctor.data]
+                if especialidades_data:
+                    usuario["especialidades_ids"] = [item["especialidad_id"] for item in especialidades_data]
                     # Mantener compatibilidad: primera especialidad como principal
-                    usuario["especialidad_id"] = especialidades_doctor.data[0].get("especialidad_id")
-                    usuario["sub_especialidad_id"] = especialidades_doctor.data[0].get("sub_especialidad_id")
+                    usuario["especialidad_id"] = especialidades_data[0].get("especialidad_id")
+                    usuario["sub_especialidad_id"] = especialidades_data[0].get("sub_especialidad_id")
                 else:
                     usuario["especialidades_ids"] = []
                     usuario["especialidad_id"] = None
@@ -408,23 +423,25 @@ async def listar_doctores_paginado(
 ):
     """
     Devuelve doctores (rol_id=2) de forma paginada con sus especialidades.
-    Optimizado para no saturar la base de datos.
+    SUPER OPTIMIZADO: 2 queries totales con LEFT JOINs (antes eran 13 queries).
     """
     try:
         # Calcular offset para la paginación
         offset = (page - 1) * page_size
         
-        # Construir query base para doctores
+        # QUERY 1: Obtener doctores con contraseña temporal en un solo JOIN
         query = (
             supabase_client
             .table("usuario_sistema")
-            .select("*", count="exact")
+            .select("""
+                *,
+                contraseñas!left(contraseña_temporal)
+            """, count="exact")
             .eq("rol_id", 2)
         )
         
         # Aplicar búsqueda si existe
         if search:
-            # Usar múltiples .ilike() en lugar de .or_() para compatibilidad
             query = query.or_(
                 f"nombre.ilike.%{search}%,"
                 f"apellido_paterno.ilike.%{search}%,"
@@ -452,59 +469,52 @@ async def listar_doctores_paginado(
         doctores = res.data
         total_count = res.count if hasattr(res, 'count') else len(doctores)
         
-        # Para cada doctor, obtener TODAS sus especialidades y contraseña temporal
+        # Extraer contraseñas del JOIN y limpiar estructura
         for doctor in doctores:
-            try:
-                especialidades_doctor = (
-                    supabase_client
-                    .table("especialidades_doctor")
-                    .select("especialidad_id, sub_especialidad_id, especialidad(id, nombre)")
-                    .eq("usuario_sistema_id", doctor["id"])
-                    .execute()
-                )
-
-                if especialidades_doctor.data:
-                    # Guardar lista completa de especialidades con nombres
-                    doctor["especialidades"] = [
-                        {
-                            "id": item["especialidad_id"],
-                            "nombre": item["especialidad"]["nombre"] if item.get("especialidad") else "Sin nombre"
-                        }
-                        for item in especialidades_doctor.data
-                    ]
-                    doctor["especialidades_ids"] = [item["especialidad_id"] for item in especialidades_doctor.data]
-                    # Mantener compatibilidad
-                    doctor["especialidad_id"] = especialidades_doctor.data[0].get("especialidad_id")
-                    doctor["sub_especialidad_id"] = especialidades_doctor.data[0].get("sub_especialidad_id")
-                else:
-                    doctor["especialidades"] = []
-                    doctor["especialidades_ids"] = []
-                    doctor["especialidad_id"] = None
-                    doctor["sub_especialidad_id"] = None
-            except Exception as esp_error:
-                print(f"Error al cargar especialidades del doctor {doctor['id']}: {str(esp_error)}")
+            contraseñas_array = doctor.pop("contraseñas", [])
+            doctor["contraseña_temporal"] = contraseñas_array[0].get("contraseña_temporal") if contraseñas_array else None
+        
+        # QUERY 2: Bulk query de especialidades de TODOS los doctores
+        doctor_ids = [doctor["id"] for doctor in doctores]
+        
+        especialidades_response = (
+            supabase_client
+            .table("especialidades_doctor")
+            .select("usuario_sistema_id, especialidad_id, sub_especialidad_id, especialidad(id, nombre)")
+            .in_("usuario_sistema_id", doctor_ids)
+            .execute()
+        )
+        
+        # Agrupar especialidades por doctor_id en dict para O(1) lookup
+        especialidades_dict = {}
+        if especialidades_response.data:
+            for item in especialidades_response.data:
+                doctor_id = item["usuario_sistema_id"]
+                if doctor_id not in especialidades_dict:
+                    especialidades_dict[doctor_id] = []
+                especialidades_dict[doctor_id].append(item)
+        
+        # Mapear especialidades usando lookups O(1)
+        for doctor in doctores:
+            doctor_id = doctor["id"]
+            especialidades_data = especialidades_dict.get(doctor_id, [])
+            
+            if especialidades_data:
+                doctor["especialidades"] = [
+                    {
+                        "id": item["especialidad_id"],
+                        "nombre": item["especialidad"]["nombre"] if item.get("especialidad") else "Sin nombre"
+                    }
+                    for item in especialidades_data
+                ]
+                doctor["especialidades_ids"] = [item["especialidad_id"] for item in especialidades_data]
+                doctor["especialidad_id"] = especialidades_data[0].get("especialidad_id")
+                doctor["sub_especialidad_id"] = especialidades_data[0].get("sub_especialidad_id")
+            else:
                 doctor["especialidades"] = []
                 doctor["especialidades_ids"] = []
                 doctor["especialidad_id"] = None
                 doctor["sub_especialidad_id"] = None
-
-            # Obtener contraseña temporal desde la tabla contraseñas
-            try:
-                clave_response = (
-                    supabase_client
-                    .table("contraseñas")
-                    .select("contraseña_temporal")
-                    .eq("id_profesional_salud", doctor["id"])
-                    .execute()
-                )
-
-                if clave_response.data and len(clave_response.data) > 0:
-                    doctor["contraseña_temporal"] = clave_response.data[0].get("contraseña_temporal")
-                else:
-                    doctor["contraseña_temporal"] = None
-            except Exception as clave_error:
-                print(f"Error al cargar contraseña temporal del doctor {doctor['id']}: {str(clave_error)}")
-                doctor["contraseña_temporal"] = None
         
         # Calcular total de páginas
         total_pages = (total_count + page_size - 1) // page_size

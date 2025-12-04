@@ -51,9 +51,10 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
     """
     Crea bloques de horario automáticamente para un día específico de la semana.
     Genera bloques desde fecha_inicio hasta fecha_fin (o 3 meses si no se especifica).
+    OPTIMIZADO: Usa bulk insert en vez de inserts individuales.
     """
     try:
-        # Validar que el usuario existe y es doctor
+        # Validar que el usuario existe y es doctor (UNA SOLA VEZ)
         usuario = supabase_client.table("usuario_sistema").select("id, rol_id").eq("id", horario.usuario_sistema_id).execute()
         if not usuario.data:
             raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -68,18 +69,17 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
         else:
             fecha_fin = fecha_inicio + timedelta(days=90)  # 3 meses por defecto
         
-        # Parsear horas
-        hora_inicio_parts = horario.hora_inicio.split(":")
-        hora_fin_parts = horario.hora_fin.split(":")
+        # Configurar timezone de Chile UNA SOLA VEZ
+        chile_tz = timezone(timedelta(hours=-3))
         
-        bloques_creados = []
+        # FASE 1: Generar TODOS los bloques en memoria (rápido)
+        bloques_a_crear = []
         fecha_actual = fecha_inicio
         
-        # Iterar por cada día hasta fecha_fin
         while fecha_actual <= fecha_fin:
             # Verificar si es el día de la semana correcto (0=Lunes, 6=Domingo)
             if fecha_actual.weekday() == horario.dia_semana:
-                # Crear bloques para este día en hora local de Chile
+                # Crear bloques para este día
                 hora_bloque = datetime.combine(
                     fecha_actual,
                     datetime.strptime(horario.hora_inicio, "%H:%M").time()
@@ -89,47 +89,93 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
                     datetime.strptime(horario.hora_fin, "%H:%M").time()
                 )
 
-                # Marcar como hora local de Chile (UTC-3) y luego convertir a UTC
-                chile_tz = timezone(timedelta(hours=-3))
-                hora_bloque = hora_bloque.replace(tzinfo=chile_tz)
-                hora_fin_dia = hora_fin_dia.replace(tzinfo=chile_tz)
-
-                # Convertir a UTC para guardar en la BD
-                hora_bloque = hora_bloque.astimezone(timezone.utc)
-                hora_fin_dia = hora_fin_dia.astimezone(timezone.utc)
+                # Convertir a UTC
+                hora_bloque = hora_bloque.replace(tzinfo=chile_tz).astimezone(timezone.utc)
+                hora_fin_dia = hora_fin_dia.replace(tzinfo=chile_tz).astimezone(timezone.utc)
                 
+                # Generar bloques del día
                 while hora_bloque < hora_fin_dia:
                     fin_bloque = hora_bloque + timedelta(minutes=horario.duracion_bloque_minutos)
                     
                     if fin_bloque > hora_fin_dia:
                         break
                     
-                    # Verificar solapamiento
-                    solapamiento = supabase_client.table("horarios_personal").select("id").eq(
-                        "usuario_sistema_id", horario.usuario_sistema_id
-                    ).gte("inicio_bloque", hora_bloque.isoformat()).lte(
-                        "inicio_bloque", fin_bloque.isoformat()
-                    ).execute()
-                    
-                    if not solapamiento.data:
-                        # Crear bloque
-                        nuevo = supabase_client.table("horarios_personal").insert({
-                            "inicio_bloque": hora_bloque.isoformat(),
-                            "finalizacion_bloque": fin_bloque.isoformat(),
-                            "usuario_sistema_id": horario.usuario_sistema_id
-                        }).execute()
-                        
-                        if nuevo.data:
-                            bloques_creados.append(nuevo.data[0])
+                    bloques_a_crear.append({
+                        "inicio_bloque": hora_bloque.isoformat(),
+                        "finalizacion_bloque": fin_bloque.isoformat(),
+                        "usuario_sistema_id": horario.usuario_sistema_id
+                    })
                     
                     hora_bloque = fin_bloque
             
             fecha_actual += timedelta(days=1)
         
-        return {
-            "mensaje": f"Se crearon {len(bloques_creados)} bloques de horario",
-            "bloques_creados": len(bloques_creados)
-        }
+        # Si no hay bloques para crear, retornar
+        if not bloques_a_crear:
+            return {
+                "mensaje": "No se generaron bloques para el rango especificado",
+                "bloques_creados": 0
+            }
+        
+        # FASE 2: Consultar solapamientos existentes (UNA SOLA QUERY)
+        # Obtener rango completo de fechas
+        primer_bloque = bloques_a_crear[0]
+        ultimo_bloque = bloques_a_crear[-1]
+        
+        horarios_existentes = supabase_client.table("horarios_personal").select(
+            "inicio_bloque, finalizacion_bloque"
+        ).eq(
+            "usuario_sistema_id", horario.usuario_sistema_id
+        ).gte(
+            "inicio_bloque", primer_bloque["inicio_bloque"]
+        ).lte(
+            "finalizacion_bloque", ultimo_bloque["finalizacion_bloque"]
+        ).execute()
+        
+        # FASE 3: Filtrar bloques que NO se solapan (en memoria, rápido)
+        bloques_validos = []
+        
+        if horarios_existentes.data:
+            # Convertir a sets para comparación rápida
+            rangos_existentes = set()
+            for h in horarios_existentes.data:
+                rangos_existentes.add((h["inicio_bloque"], h["finalizacion_bloque"]))
+            
+            # Filtrar bloques que no existen
+            for bloque in bloques_a_crear:
+                if (bloque["inicio_bloque"], bloque["finalizacion_bloque"]) not in rangos_existentes:
+                    bloques_validos.append(bloque)
+        else:
+            # No hay solapamientos, todos son válidos
+            bloques_validos = bloques_a_crear
+        
+        # FASE 4: Bulk insert (UNA SOLA TRANSACCIÓN)
+        if bloques_validos:
+            # Supabase permite insertar hasta 1000 registros por batch
+            # Si hay más, dividir en chunks
+            BATCH_SIZE = 1000
+            total_insertados = 0
+            
+            for i in range(0, len(bloques_validos), BATCH_SIZE):
+                batch = bloques_validos[i:i + BATCH_SIZE]
+                resultado = supabase_client.table("horarios_personal").insert(batch).execute()
+                
+                if resultado.data:
+                    total_insertados += len(resultado.data)
+            
+            return {
+                "mensaje": f"Se crearon {total_insertados} bloques de horario",
+                "bloques_creados": total_insertados,
+                "bloques_generados": len(bloques_a_crear),
+                "bloques_saltados": len(bloques_a_crear) - total_insertados
+            }
+        else:
+            return {
+                "mensaje": "Todos los bloques ya existen",
+                "bloques_creados": 0,
+                "bloques_generados": len(bloques_a_crear),
+                "bloques_saltados": len(bloques_a_crear)
+            }
     
     except HTTPException:
         raise

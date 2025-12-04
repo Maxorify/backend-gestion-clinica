@@ -264,22 +264,32 @@ async def listar_subespecialidades_de_especialidad(especialidad_id: int):
 async def listar_especialidades():
     """
     Devuelve todas las especialidades con sus precios.
+    OPTIMIZADO: JOIN directo en lugar de N+1 queries.
     """
     try:
+        # OPTIMIZACIÓN: LEFT JOIN con costos_servicio para obtener precios en una sola query
         res = (
             supabase_client
             .table("especialidad")
-            .select("id,nombre,descripcion")
+            .select("id,nombre,descripcion,costos_servicio!left(precio)")
             .order("id", desc=False)
             .execute()
         )
 
-        # Para cada especialidad, obtener el precio desde costos_servicio
+        # Transformar la estructura de costos_servicio (array) a precio directo
         especialidades_con_precio = []
         for esp in (res.data or []):
-            costo = supabase_client.table("costos_servicio").select("precio").eq("especialidad_id", esp["id"]).execute()
-            esp["precio"] = costo.data[0]["precio"] if costo.data else None
-            especialidades_con_precio.append(esp)
+            precio = None
+            costos = esp.pop("costos_servicio", [])  # Extraer array de costos
+            if costos and len(costos) > 0:
+                precio = costos[0].get("precio")  # Primer precio encontrado
+            
+            especialidades_con_precio.append({
+                "id": esp["id"],
+                "nombre": esp["nombre"],
+                "descripcion": esp.get("descripcion"),
+                "precio": precio
+            })
 
         return {"especialidades": especialidades_con_precio}
     except Exception as e:

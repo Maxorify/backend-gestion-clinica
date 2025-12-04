@@ -24,11 +24,12 @@ async def obtener_turnos_dia(
 ):
     """
     📊 Obtiene el resumen de asistencia del día basado en horarios_personal.
+    OPTIMIZADO: Usa queries masivas con JOINs en vez de N+1 queries.
     """
     fecha_consulta = fecha or date.today()
     
     try:
-        # 1. Obtener horarios del día desde horarios_personal
+        # OPTIMIZACIÓN 1: Query única con JOIN para horarios + doctores
         horarios_response = supabase_client.from_("horarios_personal") \
             .select("*, usuario:usuario_sistema_id(id, nombre, apellido_paterno, apellido_materno, rut, email, celular)") \
             .gte("inicio_bloque", f"{fecha_consulta}T00:00:00") \
@@ -48,7 +49,70 @@ async def obtener_turnos_dia(
                 turnos=[]
             )
         
-        # 2. Agrupar horarios por doctor
+        # Extraer IDs únicos de doctores para bulk queries
+        doctor_ids = list(set(h['usuario']['id'] for h in horarios_response.data if h.get('usuario')))
+        
+        if not doctor_ids:
+            return ResumenDiarioAsistencia(
+                fecha=fecha_consulta,
+                total_turnos=0,
+                en_turno=0,
+                asistieron=0,
+                con_atraso=0,
+                ausentes=0,
+                justificados=0,
+                turnos=[]
+            )
+        
+        # OPTIMIZACIÓN 2: Bulk query de asistencias de TODOS los doctores
+        inicio_dia = f"{fecha_consulta}T00:00:00"
+        fin_dia = f"{fecha_consulta}T23:59:59"
+        
+        asistencias_response = supabase_client.from_("asistencia") \
+            .select("*") \
+            .in_("usuario_sistema_id", doctor_ids) \
+            .gte("inicio_turno", inicio_dia) \
+            .lte("inicio_turno", fin_dia) \
+            .execute()
+        
+        # Crear diccionario de asistencias por doctor_id para lookup rápido
+        asistencias_dict = {}
+        if asistencias_response.data:
+            for asist in asistencias_response.data:
+                asistencias_dict[asist['usuario_sistema_id']] = asist
+        
+        # OPTIMIZACIÓN 3: Bulk query de especialidades de TODOS los doctores
+        especialidades_response = supabase_client.from_("especialidades_doctor") \
+            .select("usuario_sistema_id, especialidad:especialidad_id(nombre)") \
+            .in_("usuario_sistema_id", doctor_ids) \
+            .execute()
+        
+        # Agrupar especialidades por doctor_id
+        especialidades_dict = {}
+        if especialidades_response.data:
+            for esp in especialidades_response.data:
+                doctor_id = esp['usuario_sistema_id']
+                if doctor_id not in especialidades_dict:
+                    especialidades_dict[doctor_id] = []
+                if esp.get('especialidad'):
+                    especialidades_dict[doctor_id].append(esp['especialidad']['nombre'])
+        
+        # OPTIMIZACIÓN 4: Bulk query de pacientes de TODOS los doctores
+        pacientes_response = supabase_client.from_("cita_medica") \
+            .select("doctor_id") \
+            .in_("doctor_id", doctor_ids) \
+            .gte("fecha_atencion", inicio_dia) \
+            .lte("fecha_atencion", fin_dia) \
+            .execute()
+        
+        # Contar pacientes por doctor_id
+        pacientes_dict = {}
+        if pacientes_response.data:
+            for cita in pacientes_response.data:
+                doctor_id = cita['doctor_id']
+                pacientes_dict[doctor_id] = pacientes_dict.get(doctor_id, 0) + 1
+        
+        # Agrupar horarios por doctor
         doctores_dict = {}
         for horario in horarios_response.data:
             if not horario.get('usuario'):
@@ -69,45 +133,18 @@ async def obtener_turnos_dia(
             
             doctores_dict[doctor_id]['bloques'].append(horario)
         
-        # 3. Procesar cada doctor
+        # Procesar cada doctor usando datos pre-cargados
         turnos_procesados = []
         stats = {"en_turno": 0, "asistieron": 0, "con_atraso": 0, "ausentes": 0, "justificados": 0}
         
         for doctor_id, info in doctores_dict.items():
             doctor_data = info['doctor']
             
-            # Buscar si existe registro de asistencia para este doctor hoy
-            # Buscamos asistencias que coincidan con el rango de horario programado
-            inicio_programado = datetime.fromisoformat(info['inicio_turno'].replace("Z", "+00:00"))
-            fin_programado = datetime.fromisoformat(info['finalizacion_turno'].replace("Z", "+00:00"))
+            # Obtener asistencia del diccionario (O(1) lookup)
+            asistencia = asistencias_dict.get(doctor_id)
             
-            # Buscar asistencia en un rango amplio que incluya turnos que cruzan medianoche
-            asist_response = supabase_client.from_("asistencia") \
-                .select("*") \
-                .eq("usuario_sistema_id", doctor_id) \
-                .gte("inicio_turno", (inicio_programado - timedelta(days=1)).isoformat()) \
-                .lte("inicio_turno", (fin_programado + timedelta(days=1)).isoformat()) \
-                .execute()
-            
-            # Filtrar para encontrar la asistencia que corresponde a este turno
-            asistencia = None
-            if asist_response.data:
-                for asist in asist_response.data:
-                    inicio_asist = datetime.fromisoformat(asist['inicio_turno'].replace("Z", "+00:00"))
-                    # Verificar si la asistencia está dentro del rango del turno programado (con margen)
-                    if abs((inicio_asist - inicio_programado).total_seconds()) < 86400:  # Menos de 24h de diferencia
-                        asistencia = asist
-                        break
-            
-            # Obtener especialidades
-            esp_response = supabase_client.from_("especialidades_doctor") \
-                .select("especialidad:especialidad_id(nombre)") \
-                .eq("usuario_sistema_id", doctor_id) \
-                .execute()
-            
-            especialidades = []
-            if esp_response.data:
-                especialidades = [e["especialidad"]["nombre"] for e in esp_response.data if e.get("especialidad")]
+            # Obtener especialidades del diccionario (O(1) lookup)
+            especialidades = especialidades_dict.get(doctor_id, [])
             
             # Construir objeto doctor
             doctor = DoctorBasicInfo(
@@ -122,15 +159,8 @@ async def obtener_turnos_dia(
                 celular=doctor_data.get("celular")
             )
             
-            # Contar pacientes
-            pacientes_response = supabase_client.from_("cita_medica") \
-                .select("id", count="exact") \
-                .eq("doctor_id", doctor_id) \
-                .gte("fecha_atencion", f"{fecha_consulta}T00:00:00") \
-                .lte("fecha_atencion", f"{fecha_consulta}T23:59:59") \
-                .execute()
-            
-            pacientes_agendados = pacientes_response.count or 0
+            # Obtener pacientes del diccionario (O(1) lookup)
+            pacientes_agendados = pacientes_dict.get(doctor_id, 0)
             
             # Calcular estado y tiempos
             if asistencia:

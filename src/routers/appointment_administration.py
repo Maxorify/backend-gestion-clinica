@@ -186,9 +186,10 @@ async def listar_citas(
     """
     Lista todas las citas con información del paciente, doctor y especialidad.
     Filtros opcionales: fecha, doctor_id, paciente_id, estado.
+    OPTIMIZADO: Usa JOINs y bulk queries en vez de N+1.
     """
     try:
-        # Obtener todas las citas con especialidad_id incluido
+        # OPTIMIZACIÓN 1: Query con JOINs para obtener todo de una vez
         query = (
             supabase_client
             .table("cita_medica")
@@ -198,7 +199,8 @@ async def listar_citas(
                 doctor_id,
                 especialidad_id,
                 paciente:paciente_id(id, nombre, apellido_paterno, apellido_materno, telefono, rut),
-                doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno)
+                doctor:doctor_id(id, nombre, apellido_paterno, apellido_materno),
+                especialidad:especialidad_id(id, nombre)
             """)
         )
 
@@ -215,91 +217,68 @@ async def listar_citas(
         if not citas.data:
             return {"citas": []}
 
-        # Para cada cita, obtener el estado actual, especialidad y precio
-        citas_con_estado = []
-        for cita in citas.data:
-            estado_actual = (
+        # Extraer IDs de citas para bulk queries
+        citas_ids = [cita["id"] for cita in citas.data]
+        
+        # OPTIMIZACIÓN 2: Bulk query de TODOS los estados
+        estados_response = (
+            supabase_client
+            .table("estado")
+            .select("cita_medica_id, estado, id")
+            .in_("cita_medica_id", citas_ids)
+            .order("id", desc=True)
+            .execute()
+        )
+        
+        # Crear diccionario de estados (solo el más reciente por cita)
+        estados_dict = {}
+        if estados_response.data:
+            for est in estados_response.data:
+                cita_id = est["cita_medica_id"]
+                # Solo guardar el primero (ya viene ordenado desc por id)
+                if cita_id not in estados_dict:
+                    estados_dict[cita_id] = est["estado"]
+        
+        # OPTIMIZACIÓN 3: Bulk query de precios de especialidades únicas
+        especialidad_ids = list(set(
+            cita.get("especialidad_id") 
+            for cita in citas.data 
+            if cita.get("especialidad_id")
+        ))
+        
+        precios_dict = {}
+        if especialidad_ids:
+            precios_response = (
                 supabase_client
-                .table("estado")
-                .select("estado")
-                .eq("cita_medica_id", cita["id"])
-                .order("id", desc=True)
-                .limit(1)
+                .table("costos_servicio")
+                .select("especialidad_id, precio")
+                .in_("especialidad_id", especialidad_ids)
                 .execute()
             )
-
-            estado_texto = estado_actual.data[0]["estado"] if estado_actual.data else "Sin estado"
+            
+            if precios_response.data:
+                for precio in precios_response.data:
+                    precios_dict[precio["especialidad_id"]] = precio["precio"]
+        
+        # Construir respuesta usando datos pre-cargados
+        citas_con_estado = []
+        for cita in citas.data:
+            # Obtener estado del diccionario (O(1) lookup)
+            estado_texto = estados_dict.get(cita["id"], "Sin estado")
 
             # Filtrar por estado si se especificó
             if estado and estado_texto != estado:
                 continue
 
-            # Obtener la especialidad de la cita (ya no del doctor)
-            especialidad_info = None
+            # Obtener precio del diccionario (O(1) lookup)
             precio_especialidad = None
-            
             if cita.get("especialidad_id"):
-                try:
-                    # Obtener información de la especialidad directamente
-                    especialidad_data = (
-                        supabase_client
-                        .table("especialidad")
-                        .select("id, nombre")
-                        .eq("id", cita["especialidad_id"])
-                        .limit(1)
-                        .execute()
-                    )
-                    
-                    if especialidad_data.data:
-                        especialidad_info = especialidad_data.data[0]
-                        
-                        # Obtener precio de la especialidad
-                        precio_data = (
-                            supabase_client
-                            .table("costos_servicio")
-                            .select("precio")
-                            .eq("especialidad_id", cita["especialidad_id"])
-                            .limit(1)
-                            .execute()
-                        )
-                        if precio_data.data:
-                            precio_especialidad = precio_data.data[0]["precio"]
-                except Exception as esp_error:
-                    print(f"Error al obtener especialidad para cita {cita['id']}: {str(esp_error)}")
-            else:
-                # Fallback: si la cita no tiene especialidad_id, usar la primera del doctor
-                try:
-                    especialidad_doctor = (
-                        supabase_client
-                        .table("especialidades_doctor")
-                        .select("especialidad_id, especialidad:especialidad_id(id, nombre)")
-                        .eq("usuario_sistema_id", cita["doctor_id"])
-                        .limit(1)
-                        .execute()
-                    )
-                    
-                    if especialidad_doctor.data and especialidad_doctor.data[0].get("especialidad"):
-                        especialidad_info = especialidad_doctor.data[0]["especialidad"]
-                        especialidad_id = especialidad_doctor.data[0]["especialidad_id"]
-                        
-                        # Obtener precio de la especialidad
-                        precio_data = (
-                            supabase_client
-                            .table("costos_servicio")
-                            .select("precio")
-                            .eq("especialidad_id", especialidad_id)
-                            .limit(1)
-                            .execute()
-                        )
-                        if precio_data.data:
-                            precio_especialidad = precio_data.data[0]["precio"]
-                except Exception as esp_error:
-                    print(f"Error al obtener especialidad del doctor para cita {cita['id']}: {str(esp_error)}")
+                precio_especialidad = precios_dict.get(cita["especialidad_id"])
 
             citas_con_estado.append({
                 **cita,
                 "estado_actual": estado_texto,
-                "especialidad": especialidad_info,
+                "especialidad": cita.get("especialidad"),  # Ya viene del JOIN
                 "precio_especialidad": precio_especialidad
             })
 
@@ -929,13 +908,24 @@ async def procesar_pago(pago: CrearPago):
 async def listar_pagos():
     """
     Lista todos los pagos procesados con información completa de paciente, doctor, especialidad y cita.
+    OPTIMIZADO: Usa JOINs y bulk queries para eliminar N+1.
     """
     try:
-        # Obtener todos los pagos
+        # Query 1: Obtener todos los pagos con información de cita mediante JOIN
         pagos_response = (
             supabase_client
             .table("pagos")
-            .select("*, cita_medica_id")
+            .select("""
+                *,
+                cita_medica:cita_medica_id(
+                    id,
+                    paciente_id,
+                    doctor_id,
+                    horario_id,
+                    especialidad_id,
+                    fecha_atencion
+                )
+            """)
             .order("fecha_pago", desc=True)
             .execute()
         )
@@ -943,95 +933,120 @@ async def listar_pagos():
         if not pagos_response.data:
             return {"pagos": []}
 
-        pagos_completos = []
-
+        # Extraer IDs únicos para bulk queries
+        paciente_ids = set()
+        doctor_ids = set()
+        especialidad_ids = set()
+        
         for pago in pagos_response.data:
-            # Obtener información de la cita
-            cita_response = (
-                supabase_client
-                .table("cita_medica")
-                .select("id, paciente_id, doctor_id, horario_id, especialidad_id, fecha_atencion")
-                .eq("id", pago["cita_medica_id"])
-                .single()
-                .execute()
-            )
+            if pago.get("cita_medica"):
+                cita = pago["cita_medica"]
+                if cita.get("paciente_id"):
+                    paciente_ids.add(cita["paciente_id"])
+                if cita.get("doctor_id"):
+                    doctor_ids.add(cita["doctor_id"])
+                if cita.get("especialidad_id"):
+                    especialidad_ids.add(cita["especialidad_id"])
 
-            if not cita_response.data:
-                continue
-
-            cita = cita_response.data
-
-            # Obtener información del paciente
-            paciente_response = (
+        # Query 2: Bulk query para todos los pacientes
+        pacientes_dict = {}
+        if paciente_ids:
+            pacientes_response = (
                 supabase_client
                 .table("paciente")
                 .select("id, nombre, apellido_paterno, apellido_materno, rut, telefono, correo")
-                .eq("id", cita["paciente_id"])
-                .single()
+                .in_("id", list(paciente_ids))
                 .execute()
             )
+            pacientes_dict = {p["id"]: p for p in pacientes_response.data}
 
-            # Obtener información del doctor
-            doctor_response = (
+        # Query 3: Bulk query para todos los doctores
+        doctores_dict = {}
+        if doctor_ids:
+            doctores_response = (
                 supabase_client
                 .table("usuario_sistema")
                 .select("id, nombre, apellido_paterno, apellido_materno")
-                .eq("id", cita["doctor_id"])
-                .single()
+                .in_("id", list(doctor_ids))
                 .execute()
             )
+            doctores_dict = {d["id"]: d for d in doctores_response.data}
 
-            # Obtener especialidad de la cita
+        # Query 4: Bulk query para todas las especialidades
+        especialidades_dict = {}
+        if especialidad_ids:
+            especialidades_response = (
+                supabase_client
+                .table("especialidad")
+                .select("id, nombre")
+                .in_("id", list(especialidad_ids))
+                .execute()
+            )
+            especialidades_dict = {e["id"]: e for e in especialidades_response.data}
+
+        # Query 5: Bulk query para especialidades de doctores (si alguna cita no tiene especialidad)
+        doctores_sin_especialidad = []
+        for pago in pagos_response.data:
+            if pago.get("cita_medica"):
+                cita = pago["cita_medica"]
+                if not cita.get("especialidad_id") and cita.get("doctor_id"):
+                    doctores_sin_especialidad.append(cita["doctor_id"])
+
+        doctor_especialidades_dict = {}
+        if doctores_sin_especialidad:
+            doctor_esp_response = (
+                supabase_client
+                .table("especialidades_doctor")
+                .select("usuario_sistema_id, especialidad_id")
+                .in_("usuario_sistema_id", list(set(doctores_sin_especialidad)))
+                .execute()
+            )
+            
+            # Mapear especialidades por doctor (primera especialidad encontrada)
+            for de in doctor_esp_response.data:
+                if de["usuario_sistema_id"] not in doctor_especialidades_dict:
+                    doctor_especialidades_dict[de["usuario_sistema_id"]] = de["especialidad_id"]
+            
+            # Obtener los datos de esas especialidades si no las tenemos ya
+            especialidad_ids_adicionales = set(doctor_especialidades_dict.values()) - especialidad_ids
+            if especialidad_ids_adicionales:
+                especialidades_adicionales_response = (
+                    supabase_client
+                    .table("especialidad")
+                    .select("id, nombre")
+                    .in_("id", list(especialidad_ids_adicionales))
+                    .execute()
+                )
+                for e in especialidades_adicionales_response.data:
+                    especialidades_dict[e["id"]] = e
+
+        # Ensamblar respuesta usando los diccionarios
+        pagos_completos = []
+        for pago in pagos_response.data:
+            if not pago.get("cita_medica"):
+                continue
+
+            cita = pago["cita_medica"]
+            
+            # Obtener paciente, doctor y especialidad de los diccionarios
+            paciente = pacientes_dict.get(cita.get("paciente_id"))
+            doctor = doctores_dict.get(cita.get("doctor_id"))
+            
+            # Obtener especialidad (de la cita o del doctor)
             especialidad = None
             if cita.get("especialidad_id"):
-                try:
-                    especialidad_response = (
-                        supabase_client
-                        .table("especialidad")
-                        .select("id, nombre")
-                        .eq("id", cita["especialidad_id"])
-                        .single()
-                        .execute()
-                    )
-                    if especialidad_response.data:
-                        especialidad = especialidad_response.data
-                except:
-                    pass
+                especialidad = especialidades_dict.get(cita["especialidad_id"])
+            elif cita.get("doctor_id") in doctor_especialidades_dict:
+                esp_id = doctor_especialidades_dict[cita["doctor_id"]]
+                especialidad = especialidades_dict.get(esp_id)
 
-            # Si no hay especialidad en la cita, obtener la primera del doctor
-            if not especialidad:
-                try:
-                    doctor_esp_response = (
-                        supabase_client
-                        .table("especialidades_doctor")
-                        .select("especialidad_id")
-                        .eq("usuario_sistema_id", cita["doctor_id"])
-                        .limit(1)
-                        .execute()
-                    )
-                    
-                    if doctor_esp_response.data:
-                        esp_id = doctor_esp_response.data[0]["especialidad_id"]
-                        especialidad_response = (
-                            supabase_client
-                            .table("especialidad")
-                            .select("id, nombre")
-                            .eq("id", esp_id)
-                            .single()
-                            .execute()
-                        )
-                        if especialidad_response.data:
-                            especialidad = especialidad_response.data
-                except:
-                    pass
-
-            if paciente_response.data and doctor_response.data:
+            if paciente and doctor:
                 pagos_completos.append({
                     "pago": pago,
                     "cita_id": cita["id"],
                     "fecha_atencion": cita["fecha_atencion"],
-                    "paciente": paciente_response.data,
-                    "doctor": doctor_response.data,
+                    "paciente": paciente,
+                    "doctor": doctor,
                     "especialidad": especialidad
                 })
 
