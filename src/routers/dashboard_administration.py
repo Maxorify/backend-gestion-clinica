@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from src.utils.supabase import supabase_client
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
 dashboard_router = APIRouter(tags=["Dashboard"], prefix="/Dashboard")

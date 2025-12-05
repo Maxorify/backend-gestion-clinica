@@ -17,6 +17,23 @@ CREATE TABLE public.asistencia (
   CONSTRAINT asistencia_pkey PRIMARY KEY (id),
   CONSTRAINT asistencia_usuario_sistema_id_fkey FOREIGN KEY (usuario_sistema_id) REFERENCES public.usuario_sistema(id)
 );
+CREATE TABLE public.asistencia_estados (
+  id bigint NOT NULL DEFAULT nextval('asistencia_estados_id_seq'::regclass),
+  asistencia_id bigint NOT NULL,
+  estado character varying NOT NULL CHECK (estado::text = ANY (ARRAY['ASISTIO'::character varying, 'ATRASO'::character varying, 'AUSENTE'::character varying, 'JUSTIFICADO'::character varying, 'PARCIAL'::character varying, 'EN_TURNO'::character varying]::text[])),
+  minutos_atraso integer DEFAULT 0 CHECK (minutos_atraso >= 0),
+  minutos_trabajados integer CHECK (minutos_trabajados >= 0),
+  porcentaje_asistencia numeric CHECK (porcentaje_asistencia >= 0::numeric AND porcentaje_asistencia <= 100::numeric),
+  tipo_justificacion character varying CHECK (tipo_justificacion::text = ANY (ARRAY['PERMISO_MEDICO'::character varying, 'REUNION_INSTITUCIONAL'::character varying, 'EMERGENCIA_FAMILIAR'::character varying, 'CAPACITACION'::character varying, 'LICENCIA_MEDICA'::character varying, 'OTRO'::character varying]::text[])),
+  justificacion text,
+  justificado_por bigint,
+  fecha_justificacion timestamp with time zone,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT asistencia_estados_pkey PRIMARY KEY (id),
+  CONSTRAINT asistencia_estados_asistencia_id_fkey FOREIGN KEY (asistencia_id) REFERENCES public.asistencia(id),
+  CONSTRAINT asistencia_estados_justificado_por_fkey FOREIGN KEY (justificado_por) REFERENCES public.usuario_sistema(id)
+);
 CREATE TABLE public.cita_medica (
   id bigint NOT NULL DEFAULT nextval('cita_medica_id_seq'::regclass),
   fecha_atencion timestamp with time zone NOT NULL,
@@ -113,6 +130,22 @@ CREATE TABLE public.informacion_cita (
   CONSTRAINT informacion_cita_diagnostico_id_fkey FOREIGN KEY (diagnostico_id) REFERENCES public.diagnosticos(id),
   CONSTRAINT informacion_cita_cita_medica_id_fkey FOREIGN KEY (cita_medica_id) REFERENCES public.cita_medica(id)
 );
+CREATE TABLE public.marcas_asistencia (
+  id bigint NOT NULL DEFAULT nextval('marcas_asistencia_id_seq'::regclass),
+  usuario_sistema_id bigint NOT NULL,
+  horario_id bigint,
+  tipo_marca character varying NOT NULL CHECK (tipo_marca::text = ANY (ARRAY['ENTRADA'::character varying, 'SALIDA'::character varying]::text[])),
+  fecha_hora_marca timestamp with time zone NOT NULL DEFAULT now(),
+  fuente character varying NOT NULL DEFAULT 'WEB'::character varying CHECK (fuente::text = ANY (ARRAY['WEB'::character varying, 'MANUAL'::character varying, 'BIOMETRICO'::character varying, 'APP'::character varying]::text[])),
+  registrado_por bigint,
+  notas text,
+  origen_ip character varying,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT marcas_asistencia_pkey PRIMARY KEY (id),
+  CONSTRAINT marcas_asistencia_usuario_sistema_id_fkey FOREIGN KEY (usuario_sistema_id) REFERENCES public.usuario_sistema(id),
+  CONSTRAINT marcas_asistencia_horario_id_fkey FOREIGN KEY (horario_id) REFERENCES public.horarios_personal(id),
+  CONSTRAINT marcas_asistencia_registrado_por_fkey FOREIGN KEY (registrado_por) REFERENCES public.usuario_sistema(id)
+);
 CREATE TABLE public.paciente (
   id bigint NOT NULL DEFAULT nextval('paciente_id_seq'::regclass),
   nombre text NOT NULL,
@@ -140,6 +173,17 @@ CREATE TABLE public.pagos (
   cita_medica_id bigint NOT NULL,
   CONSTRAINT pagos_pkey PRIMARY KEY (id),
   CONSTRAINT pagos_cita_medica_id_fkey FOREIGN KEY (cita_medica_id) REFERENCES public.cita_medica(id)
+);
+CREATE TABLE public.parametros_asistencia (
+  id bigint NOT NULL DEFAULT nextval('parametros_asistencia_id_seq'::regclass),
+  parametro character varying NOT NULL UNIQUE,
+  valor_numerico integer,
+  valor_texto text,
+  descripcion text,
+  activo boolean NOT NULL DEFAULT true,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT parametros_asistencia_pkey PRIMARY KEY (id)
 );
 CREATE TABLE public.prevencion (
   id bigint NOT NULL DEFAULT nextval('prevencion_id_seq'::regclass),

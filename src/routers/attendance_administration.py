@@ -4,7 +4,8 @@ REESCRITURA COMPLETA - Basado en horarios_personal
 """
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from typing import List, Optional
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from src.utils.supabase import supabase_client
 from src.models.asistencia import (
     MarcaAsistenciaCreate, MarcaAsistenciaResponse,
@@ -18,6 +19,19 @@ from src.models.asistencia import (
 attendance_router = APIRouter(tags=["Asistencia Profesional"], prefix="/asistencia")
 
 
+def parse_datetime_utc(dt_string: str) -> datetime:
+    """Helper para parsear datetime asegurando que tenga timezone UTC"""
+    if not dt_string:
+        return None
+    if dt_string.endswith('Z'):
+        return datetime.fromisoformat(dt_string.replace("Z", "+00:00"))
+    elif '+' in dt_string or dt_string.count(':') > 2:  # Tiene offset
+        return datetime.fromisoformat(dt_string)
+    else:
+        # Sin timezone, asumir UTC
+        return datetime.fromisoformat(dt_string).replace(tzinfo=timezone.utc)
+
+
 @attendance_router.get("/turnos-dia", response_model=ResumenDiarioAsistencia)
 async def obtener_turnos_dia(
     fecha: Optional[date] = Query(None, description="Fecha a consultar (default: hoy)"),
@@ -27,17 +41,30 @@ async def obtener_turnos_dia(
     OPTIMIZADO: Usa queries masivas con JOINs en vez de N+1 queries.
     """
     fecha_consulta = fecha or date.today()
+    chile_tz = ZoneInfo("America/Santiago")
     
     try:
         # OPTIMIZACIÓN 1: Query única con JOIN para horarios + doctores
+        # Ampliar rango para cubrir bloques que cruzan medianoche UTC
+        fecha_inicio_ampliada = fecha_consulta - timedelta(days=1)
+        fecha_fin_ampliada = fecha_consulta + timedelta(days=1)
+        
         horarios_response = supabase_client.from_("horarios_personal") \
             .select("*, usuario:usuario_sistema_id(id, nombre, apellido_paterno, apellido_materno, rut, email, celular)") \
-            .gte("inicio_bloque", f"{fecha_consulta}T00:00:00") \
-            .lte("inicio_bloque", f"{fecha_consulta}T23:59:59") \
+            .gte("inicio_bloque", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_bloque", f"{fecha_fin_ampliada}T23:59:59") \
             .order("inicio_bloque", desc=False) \
             .execute()
         
-        if not horarios_response.data:
+        # Filtrar bloques que pertenecen a la fecha en hora Chile
+        horarios_chile = []
+        for h in (horarios_response.data or []):
+            inicio_utc = parse_datetime_utc(h['inicio_bloque'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            if inicio_chile.date() == fecha_consulta:
+                horarios_chile.append(h)
+        
+        if not horarios_chile:
             return ResumenDiarioAsistencia(
                 fecha=fecha_consulta,
                 total_turnos=0,
@@ -50,7 +77,7 @@ async def obtener_turnos_dia(
             )
         
         # Extraer IDs únicos de doctores para bulk queries
-        doctor_ids = list(set(h['usuario']['id'] for h in horarios_response.data if h.get('usuario')))
+        doctor_ids = list(set(h['usuario']['id'] for h in horarios_chile if h.get('usuario')))
         
         if not doctor_ids:
             return ResumenDiarioAsistencia(
@@ -64,22 +91,25 @@ async def obtener_turnos_dia(
                 turnos=[]
             )
         
-        # OPTIMIZACIÓN 2: Bulk query de asistencias de TODOS los doctores
-        inicio_dia = f"{fecha_consulta}T00:00:00"
-        fin_dia = f"{fecha_consulta}T23:59:59"
+        # OPTIMIZACIÓN 2: Bulk query de asistencias de TODOS los doctores (ampliar rango)
+        fecha_inicio_ampliada = fecha_consulta - timedelta(days=1)
+        fecha_fin_ampliada = fecha_consulta + timedelta(days=1)
         
         asistencias_response = supabase_client.from_("asistencia") \
             .select("*") \
             .in_("usuario_sistema_id", doctor_ids) \
-            .gte("inicio_turno", inicio_dia) \
-            .lte("inicio_turno", fin_dia) \
+            .gte("inicio_turno", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_turno", f"{fecha_fin_ampliada}T23:59:59") \
             .execute()
         
-        # Crear diccionario de asistencias por doctor_id para lookup rápido
+        # Crear diccionario de asistencias por doctor_id (filtrando por fecha Chile)
         asistencias_dict = {}
         if asistencias_response.data:
             for asist in asistencias_response.data:
-                asistencias_dict[asist['usuario_sistema_id']] = asist
+                inicio_utc = parse_datetime_utc(asist['inicio_turno'])
+                inicio_chile = inicio_utc.astimezone(chile_tz)
+                if inicio_chile.date() == fecha_consulta:
+                    asistencias_dict[asist['usuario_sistema_id']] = asist
         
         # OPTIMIZACIÓN 3: Bulk query de especialidades de TODOS los doctores
         especialidades_response = supabase_client.from_("especialidades_doctor") \
@@ -97,20 +127,23 @@ async def obtener_turnos_dia(
                 if esp.get('especialidad'):
                     especialidades_dict[doctor_id].append(esp['especialidad']['nombre'])
         
-        # OPTIMIZACIÓN 4: Bulk query de pacientes de TODOS los doctores
+        # OPTIMIZACIÓN 4: Bulk query de pacientes de TODOS los doctores (ampliar rango)
         pacientes_response = supabase_client.from_("cita_medica") \
-            .select("doctor_id") \
+            .select("doctor_id, fecha_atencion") \
             .in_("doctor_id", doctor_ids) \
-            .gte("fecha_atencion", inicio_dia) \
-            .lte("fecha_atencion", fin_dia) \
+            .gte("fecha_atencion", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("fecha_atencion", f"{fecha_fin_ampliada}T23:59:59") \
             .execute()
         
-        # Contar pacientes por doctor_id
+        # Contar pacientes por doctor_id (filtrando por fecha Chile)
         pacientes_dict = {}
         if pacientes_response.data:
             for cita in pacientes_response.data:
-                doctor_id = cita['doctor_id']
-                pacientes_dict[doctor_id] = pacientes_dict.get(doctor_id, 0) + 1
+                fecha_utc = parse_datetime_utc(cita['fecha_atencion'])
+                fecha_chile = fecha_utc.astimezone(chile_tz)
+                if fecha_chile.date() == fecha_consulta:
+                    doctor_id = cita['doctor_id']
+                    pacientes_dict[doctor_id] = pacientes_dict.get(doctor_id, 0) + 1
         
         # Agrupar horarios por doctor
         doctores_dict = {}
@@ -165,10 +198,10 @@ async def obtener_turnos_dia(
             # Calcular estado y tiempos
             if asistencia:
                 # Tiene asistencia registrada
-                inicio_real = datetime.fromisoformat(asistencia['inicio_turno'].replace("Z", "+00:00"))
-                fin_real = datetime.fromisoformat(asistencia['finalizacion_turno'].replace("Z", "+00:00")) if asistencia.get('finalizacion_turno') else None
+                inicio_real = parse_datetime_utc(asistencia['inicio_turno'])
+                fin_real = parse_datetime_utc(asistencia['finalizacion_turno']) if asistencia.get('finalizacion_turno') else None
                 
-                inicio_programado = datetime.fromisoformat(info['inicio_turno'].replace("Z", "+00:00"))
+                inicio_programado = parse_datetime_utc(info['inicio_turno'])
                 
                 # Calcular atraso
                 minutos_atraso = max(0, int((inicio_real - inicio_programado).total_seconds() / 60))
@@ -199,8 +232,8 @@ async def obtener_turnos_dia(
                 marca_salida = fin_real
             else:
                 # No tiene asistencia - verificar si debería estar
-                inicio_programado = datetime.fromisoformat(info['inicio_turno'].replace("Z", "+00:00"))
-                fin_programado = datetime.fromisoformat(info['finalizacion_turno'].replace("Z", "+00:00"))
+                inicio_programado = parse_datetime_utc(info['inicio_turno'])
+                fin_programado = parse_datetime_utc(info['finalizacion_turno'])
                 ahora = datetime.now(inicio_programado.tzinfo)
                 
                 if ahora >= fin_programado:
@@ -225,8 +258,8 @@ async def obtener_turnos_dia(
             turno_detalle = TurnoAsistenciaDetalle(
                 id=asistencia['id'] if asistencia else info['primer_bloque']['id'],
                 horario_id=info['primer_bloque']['id'],
-                inicio_turno=datetime.fromisoformat(info['inicio_turno'].replace("Z", "+00:00")),
-                finalizacion_turno=datetime.fromisoformat(info['finalizacion_turno'].replace("Z", "+00:00")),
+                inicio_turno=parse_datetime_utc(info['inicio_turno']),
+                finalizacion_turno=parse_datetime_utc(info['finalizacion_turno']),
                 doctor=doctor,
                 estado_asistencia=estado,
                 minutos_atraso=minutos_atraso,
@@ -240,7 +273,7 @@ async def obtener_turnos_dia(
                 tipo_justificacion=None,
                 pacientes_agendados=pacientes_agendados,
                 pacientes_atendidos=0,
-                created_at=datetime.now()
+                created_at=datetime.now(timezone.utc)
             )
             
             turnos_procesados.append(turno_detalle)
@@ -274,7 +307,7 @@ async def registrar_entrada(usuario_sistema_id: int):
         # Registrar inicio
         nuevo_registro = {
             "usuario_sistema_id": usuario_sistema_id,
-            "inicio_turno": datetime.now().isoformat()
+            "inicio_turno": datetime.now(timezone.utc).isoformat()
         }
         
         resultado = supabase_client.from_("asistencia").insert(nuevo_registro).execute()
@@ -300,7 +333,7 @@ async def registrar_salida(asistencia_id: int):
             raise HTTPException(status_code=409, detail="Turno ya finalizado")
         
         # Registrar finalización
-        resultado = supabase_client.from_("asistencia").update({"finalizacion_turno": datetime.now().isoformat()}).eq("id", asistencia_id).execute()
+        resultado = supabase_client.from_("asistencia").update({"finalizacion_turno": datetime.now(timezone.utc).isoformat()}).eq("id", asistencia_id).execute()
         
         return {"mensaje": "Salida registrada", "asistencia": resultado.data[0]}
     except HTTPException:
@@ -381,11 +414,11 @@ async def obtener_detalle_completo_doctor(
         
         if asist_response.data:
             asistencia_hoy = asist_response.data[0]
-            inicio_real = datetime.fromisoformat(asistencia_hoy['inicio_turno'].replace("Z", "+00:00"))
-            fin_real = datetime.fromisoformat(asistencia_hoy['finalizacion_turno'].replace("Z", "+00:00")) if asistencia_hoy.get('finalizacion_turno') else None
+            inicio_real = parse_datetime_utc(asistencia_hoy['inicio_turno'])
+            fin_real = parse_datetime_utc(asistencia_hoy['finalizacion_turno']) if asistencia_hoy.get('finalizacion_turno') else None
             
             if turno_programado:
-                inicio_prog = datetime.fromisoformat(turno_programado['inicio'].replace("Z", "+00:00"))
+                inicio_prog = parse_datetime_utc(turno_programado['inicio'])
                 minutos_atraso = max(0, int((inicio_real - inicio_prog).total_seconds() / 60))
             
             if fin_real:
@@ -568,11 +601,11 @@ async def obtener_estadisticas_periodo(
                 .execute()
             
             if horario_dia.data:
-                inicio_prog = datetime.fromisoformat(horario_dia.data[0]['inicio_bloque'].replace("Z", "+00:00"))
-                fin_prog = datetime.fromisoformat(horario_dia.data[-1]['finalizacion_bloque'].replace("Z", "+00:00"))
+                inicio_prog = parse_datetime_utc(horario_dia.data[0]['inicio_bloque'])
+                fin_prog = parse_datetime_utc(horario_dia.data[-1]['finalizacion_bloque'])
                 
-                inicio_real = datetime.fromisoformat(asistencia['inicio_turno'].replace("Z", "+00:00"))
-                fin_real = datetime.fromisoformat(asistencia['finalizacion_turno'].replace("Z", "+00:00")) if asistencia.get('finalizacion_turno') else datetime.now(inicio_real.tzinfo)
+                inicio_real = parse_datetime_utc(asistencia['inicio_turno'])
+                fin_real = parse_datetime_utc(asistencia['finalizacion_turno']) if asistencia.get('finalizacion_turno') else datetime.now(inicio_real.tzinfo)
                 
                 # Calcular atraso
                 minutos_atraso = max(0, int((inicio_real - inicio_prog).total_seconds() / 60))
@@ -698,9 +731,9 @@ async def obtener_historial_diario(
             
             # Calcular atraso
             minutos_atraso = 0
-            if turno_prog_inicio:
-                inicio_prog = datetime.fromisoformat(turno_prog_inicio.replace("Z", "+00:00"))
-                inicio_real = datetime.fromisoformat(asist['inicio_turno'].replace("Z", "+00:00"))
+            if turno_prog_inicio and asist:
+                inicio_prog = parse_datetime_utc(turno_prog_inicio)
+                inicio_real = parse_datetime_utc(asist['inicio_turno'])
                 minutos_atraso = max(0, int((inicio_real - inicio_prog).total_seconds() / 60))
             
             # Estado del día
@@ -852,7 +885,7 @@ async def agregar_justificacion_doctor(
             "tipo_justificacion": tipo_justificacion,
             "justificacion": descripcion,
             "justificado_por": justificado_por,
-            "fecha_justificacion": datetime.now().isoformat()
+            "fecha_justificacion": datetime.now(timezone.utc).isoformat()
         }
         
         # Verificar si ya existe
@@ -893,43 +926,62 @@ async def obtener_mi_turno_hoy(
     📋 Obtiene el turno del día y estado de asistencia del doctor.
     """
     fecha_consulta = fecha or date.today()
+    chile_tz = ZoneInfo("America/Santiago")
     
     try:
-        # Buscar horarios del doctor para hoy
+        # Buscar horarios del doctor ampliando rango para cubrir bloques que cruzan medianoche UTC
+        fecha_inicio_ampliada = fecha_consulta - timedelta(days=1)
+        fecha_fin_ampliada = fecha_consulta + timedelta(days=1)
+        
         horarios_response = supabase_client.from_("horarios_personal") \
             .select("*") \
             .eq("usuario_sistema_id", usuario_id) \
-            .gte("inicio_bloque", f"{fecha_consulta}T00:00:00") \
-            .lte("inicio_bloque", f"{fecha_consulta}T23:59:59") \
+            .gte("inicio_bloque", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_bloque", f"{fecha_fin_ampliada}T23:59:59") \
             .order("inicio_bloque", desc=False) \
             .execute()
         
-        if not horarios_response.data:
+        # Filtrar bloques que pertenecen a la fecha en hora Chile
+        horarios_chile = []
+        for h in (horarios_response.data or []):
+            inicio_utc = parse_datetime_utc(h['inicio_bloque'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            if inicio_chile.date() == fecha_consulta:
+                horarios_chile.append(h)
+        
+        if not horarios_chile:
             return {
                 "tiene_turno": False,
                 "mensaje": "No tienes turno programado para hoy"
             }
         
         # Calcular rango del turno
-        primer_bloque = horarios_response.data[0]
-        ultimo_bloque = horarios_response.data[-1]
+        primer_bloque = horarios_chile[0]
+        ultimo_bloque = horarios_chile[-1]
         
         inicio_turno = primer_bloque['inicio_bloque']
         fin_turno = ultimo_bloque['finalizacion_bloque']
         
-        # Buscar asistencia registrada
+        # Buscar asistencia registrada (ampliar rango para cubrir horarios que cruzan medianoche)
         asistencia_response = supabase_client.from_("asistencia") \
             .select("*") \
             .eq("usuario_sistema_id", usuario_id) \
-            .gte("inicio_turno", f"{fecha_consulta}T00:00:00") \
-            .lte("inicio_turno", f"{fecha_consulta}T23:59:59") \
+            .gte("inicio_turno", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_turno", f"{fecha_fin_ampliada}T23:59:59") \
             .execute()
         
-        asistencia = asistencia_response.data[0] if asistencia_response.data else None
+        # Filtrar asistencias que pertenecen a la fecha en hora Chile
+        asistencia = None
+        for asist in (asistencia_response.data or []):
+            inicio_utc = parse_datetime_utc(asist['inicio_turno'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            if inicio_chile.date() == fecha_consulta:
+                asistencia = asist
+                break
         
-        # Calcular estado
-        ahora = datetime.now()
-        inicio_prog = datetime.fromisoformat(inicio_turno.replace("Z", "+00:00"))
+        # Calcular estado - usar timezone del dato de BD para compatibilidad
+        inicio_prog = parse_datetime_utc(inicio_turno)
+        ahora = datetime.now(inicio_prog.tzinfo)  # Usar mismo timezone que los datos
         
         if asistencia:
             tiene_entrada = True
@@ -938,15 +990,15 @@ async def obtener_mi_turno_hoy(
             hora_salida = asistencia.get('finalizacion_turno')
             
             # Calcular atraso
-            entrada_dt = datetime.fromisoformat(hora_entrada.replace("Z", "+00:00"))
+            entrada_dt = parse_datetime_utc(hora_entrada)
             minutos_atraso = max(0, int((entrada_dt - inicio_prog).total_seconds() / 60))
             
             # Calcular horas trabajadas
             if hora_salida:
-                salida_dt = datetime.fromisoformat(hora_salida.replace("Z", "+00:00"))
+                salida_dt = parse_datetime_utc(hora_salida)
                 horas_trabajadas = (salida_dt - entrada_dt).total_seconds() / 3600
             else:
-                horas_trabajadas = (ahora - entrada_dt.replace(tzinfo=None)).total_seconds() / 3600
+                horas_trabajadas = (ahora - entrada_dt).total_seconds() / 3600
         else:
             tiene_entrada = False
             tiene_salida = False
@@ -960,7 +1012,7 @@ async def obtener_mi_turno_hoy(
             "turno_programado": {
                 "inicio": inicio_turno,
                 "fin": fin_turno,
-                "total_bloques": len(horarios_response.data)
+                "total_bloques": len(horarios_chile)
             },
             "asistencia": {
                 "id": asistencia['id'] if asistencia else None,
@@ -988,29 +1040,45 @@ async def marcar_entrada_doctor(
     """
     try:
         fecha_hoy = date.today()
-        ahora = datetime.now()
+        ahora = datetime.now(timezone.utc)
+        chile_tz = ZoneInfo("America/Santiago")
         
-        # Verificar que tenga turno hoy
+        # Verificar que tenga turno hoy (ampliar rango para cubrir bloques que cruzan medianoche UTC)
+        fecha_inicio_ampliada = fecha_hoy - timedelta(days=1)
+        fecha_fin_ampliada = fecha_hoy + timedelta(days=1)
+        
         horarios_response = supabase_client.from_("horarios_personal") \
             .select("*") \
             .eq("usuario_sistema_id", usuario_id) \
-            .gte("inicio_bloque", f"{fecha_hoy}T00:00:00") \
-            .lte("inicio_bloque", f"{fecha_hoy}T23:59:59") \
+            .gte("inicio_bloque", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_bloque", f"{fecha_fin_ampliada}T23:59:59") \
             .execute()
         
-        if not horarios_response.data:
+        # Filtrar bloques que pertenecen a hoy en hora Chile
+        horarios_chile = []
+        for h in (horarios_response.data or []):
+            inicio_utc = parse_datetime_utc(h['inicio_bloque'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            if inicio_chile.date() == fecha_hoy:
+                horarios_chile.append(h)
+        
+        if not horarios_chile:
             raise HTTPException(status_code=400, detail="No tienes turno programado para hoy")
         
-        # Verificar que no haya marcado ya
+        # Verificar que no haya marcado ya (ampliar rango)
         asistencia_response = supabase_client.from_("asistencia") \
             .select("*") \
             .eq("usuario_sistema_id", usuario_id) \
-            .gte("inicio_turno", f"{fecha_hoy}T00:00:00") \
-            .lte("inicio_turno", f"{fecha_hoy}T23:59:59") \
+            .gte("inicio_turno", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_turno", f"{fecha_fin_ampliada}T23:59:59") \
             .execute()
         
-        if asistencia_response.data:
-            raise HTTPException(status_code=400, detail="Ya marcaste entrada hoy")
+        # Filtrar asistencias que pertenecen a hoy en hora Chile
+        for asist in (asistencia_response.data or []):
+            inicio_utc = parse_datetime_utc(asist['inicio_turno'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            if inicio_chile.date() == fecha_hoy:
+                raise HTTPException(status_code=400, detail="Ya marcaste entrada hoy")
         
         # Registrar entrada
         asistencia_data = {
@@ -1044,20 +1112,31 @@ async def marcar_salida_doctor(
     """
     try:
         fecha_hoy = date.today()
-        ahora = datetime.now()
+        ahora = datetime.now(timezone.utc)
+        chile_tz = ZoneInfo("America/Santiago")
         
-        # Buscar asistencia del día
+        # Buscar asistencia del día (ampliar rango para cubrir horarios que cruzan medianoche)
+        fecha_inicio_ampliada = fecha_hoy - timedelta(days=1)
+        fecha_fin_ampliada = fecha_hoy + timedelta(days=1)
+        
         asistencia_response = supabase_client.from_("asistencia") \
             .select("*") \
             .eq("usuario_sistema_id", usuario_id) \
-            .gte("inicio_turno", f"{fecha_hoy}T00:00:00") \
-            .lte("inicio_turno", f"{fecha_hoy}T23:59:59") \
+            .gte("inicio_turno", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_turno", f"{fecha_fin_ampliada}T23:59:59") \
             .execute()
         
-        if not asistencia_response.data:
-            raise HTTPException(status_code=400, detail="No has marcado entrada hoy")
+        # Filtrar asistencias que pertenecen a hoy en hora Chile
+        asistencia = None
+        for asist in (asistencia_response.data or []):
+            inicio_utc = parse_datetime_utc(asist['inicio_turno'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            if inicio_chile.date() == fecha_hoy:
+                asistencia = asist
+                break
         
-        asistencia = asistencia_response.data[0]
+        if not asistencia:
+            raise HTTPException(status_code=400, detail="No has marcado entrada hoy")
         
         if asistencia.get('finalizacion_turno'):
             raise HTTPException(status_code=400, detail="Ya marcaste salida hoy")
@@ -1069,8 +1148,8 @@ async def marcar_salida_doctor(
             .execute()
         
         # Calcular horas trabajadas
-        entrada = datetime.fromisoformat(asistencia['inicio_turno'].replace("Z", "+00:00"))
-        horas_trabajadas = (ahora - entrada.replace(tzinfo=None)).total_seconds() / 3600
+        entrada = parse_datetime_utc(asistencia['inicio_turno'])
+        horas_trabajadas = (ahora - entrada).total_seconds() / 3600
         
         return {
             "mensaje": "Salida registrada exitosamente",

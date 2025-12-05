@@ -8,6 +8,8 @@ from src.models.citas import (
 )
 from src.utils.supabase import supabase_client
 from typing import Optional, List
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from datetime import datetime, date
 from pydantic import BaseModel
 
@@ -189,6 +191,8 @@ async def listar_citas(
     OPTIMIZADO: Usa JOINs y bulk queries en vez de N+1.
     """
     try:
+        chile_tz = ZoneInfo("America/Santiago")
+        
         # OPTIMIZACIÓN 1: Query con JOINs para obtener todo de una vez
         query = (
             supabase_client
@@ -204,21 +208,37 @@ async def listar_citas(
             """)
         )
 
-        # Aplicar filtros
+        # Aplicar filtros - ampliar rango si hay filtro de fecha para cubrir bloques que cruzan medianoche
         if fecha:
-            query = query.gte("fecha_atencion", f"{fecha}T00:00:00").lte("fecha_atencion", f"{fecha}T23:59:59")
+            fecha_dt = datetime.fromisoformat(fecha).date()
+            fecha_inicio = fecha_dt - timedelta(days=1)
+            fecha_fin = fecha_dt + timedelta(days=1)
+            query = query.gte("fecha_atencion", f"{fecha_inicio}T00:00:00").lte("fecha_atencion", f"{fecha_fin}T23:59:59")
+        
         if doctor_id:
             query = query.eq("doctor_id", doctor_id)
         if paciente_id:
             query = query.eq("paciente_id", paciente_id)
 
-        citas = query.order("fecha_atencion", desc=False).execute()
+        citas_result = query.order("fecha_atencion", desc=False).execute()
+        
+        # Filtrar citas por fecha Chile si se especificó fecha
+        citas_filtradas = []
+        if fecha and citas_result.data:
+            fecha_dt = datetime.fromisoformat(fecha).date()
+            for cita in citas_result.data:
+                fecha_atencion_utc = datetime.fromisoformat(cita['fecha_atencion'].replace('Z', '+00:00'))
+                fecha_atencion_chile = fecha_atencion_utc.astimezone(chile_tz)
+                if fecha_atencion_chile.date() == fecha_dt:
+                    citas_filtradas.append(cita)
+        else:
+            citas_filtradas = citas_result.data or []
 
-        if not citas.data:
+        if not citas_filtradas:
             return {"citas": []}
 
         # Extraer IDs de citas para bulk queries
-        citas_ids = [cita["id"] for cita in citas.data]
+        citas_ids = [cita["id"] for cita in citas_filtradas]
         
         # OPTIMIZACIÓN 2: Bulk query de TODOS los estados
         estados_response = (
@@ -242,7 +262,7 @@ async def listar_citas(
         # OPTIMIZACIÓN 3: Bulk query de precios de especialidades únicas
         especialidad_ids = list(set(
             cita.get("especialidad_id") 
-            for cita in citas.data 
+            for cita in citas_filtradas 
             if cita.get("especialidad_id")
         ))
         
@@ -262,7 +282,7 @@ async def listar_citas(
         
         # Construir respuesta usando datos pre-cargados
         citas_con_estado = []
-        for cita in citas.data:
+        for cita in citas_filtradas:
             # Obtener estado del diccionario (O(1) lookup)
             estado_texto = estados_dict.get(cita["id"], "Sin estado")
 

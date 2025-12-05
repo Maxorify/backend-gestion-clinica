@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from src.utils.supabase import supabase_client
 from src.models.horarios import HorarioBloque, CrearHorarioSemanal, ActualizarHorario
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 schedule_router = APIRouter(tags=["Gestión de Horarios"], prefix="/Horarios")
@@ -54,6 +55,16 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
     OPTIMIZADO: Usa bulk insert en vez de inserts individuales.
     """
     try:
+        # 🔍 DEBUG: Ver qué recibe el backend
+        print(f"🔍 CREAR HORARIO SEMANAL - Datos recibidos:")
+        print(f"   usuario_sistema_id: {horario.usuario_sistema_id}")
+        print(f"   dia_semana: {horario.dia_semana}")
+        print(f"   hora_inicio: {horario.hora_inicio}")
+        print(f"   hora_fin: {horario.hora_fin}")
+        print(f"   duracion_bloque_minutos: {horario.duracion_bloque_minutos}")
+        print(f"   fecha_inicio: {horario.fecha_inicio}")
+        print(f"   fecha_fin: {horario.fecha_fin}")
+        
         # Validar que el usuario existe y es doctor (UNA SOLA VEZ)
         usuario = supabase_client.table("usuario_sistema").select("id, rol_id").eq("id", horario.usuario_sistema_id).execute()
         if not usuario.data:
@@ -69,8 +80,8 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
         else:
             fecha_fin = fecha_inicio + timedelta(days=90)  # 3 meses por defecto
         
-        # Configurar timezone de Chile UNA SOLA VEZ
-        chile_tz = timezone(timedelta(hours=-3))
+        # Timezone de Chile para conversión correcta
+        chile_tz = ZoneInfo("America/Santiago")
         
         # FASE 1: Generar TODOS los bloques en memoria (rápido)
         bloques_a_crear = []
@@ -79,34 +90,36 @@ async def crear_horario_semanal(horario: CrearHorarioSemanal):
         while fecha_actual <= fecha_fin:
             # Verificar si es el día de la semana correcto (0=Lunes, 6=Domingo)
             if fecha_actual.weekday() == horario.dia_semana:
-                # Crear bloques para este día
-                hora_bloque = datetime.combine(
+                # Crear bloques en hora Chile y convertir a UTC para guardar
+                hora_bloque_chile = datetime.combine(
                     fecha_actual,
-                    datetime.strptime(horario.hora_inicio, "%H:%M").time()
+                    datetime.strptime(horario.hora_inicio, "%H:%M").time(),
+                    tzinfo=chile_tz
                 )
-                hora_fin_dia = datetime.combine(
+                hora_fin_dia_chile = datetime.combine(
                     fecha_actual,
-                    datetime.strptime(horario.hora_fin, "%H:%M").time()
+                    datetime.strptime(horario.hora_fin, "%H:%M").time(),
+                    tzinfo=chile_tz
                 )
-
-                # Convertir a UTC
-                hora_bloque = hora_bloque.replace(tzinfo=chile_tz).astimezone(timezone.utc)
-                hora_fin_dia = hora_fin_dia.replace(tzinfo=chile_tz).astimezone(timezone.utc)
                 
                 # Generar bloques del día
-                while hora_bloque < hora_fin_dia:
-                    fin_bloque = hora_bloque + timedelta(minutes=horario.duracion_bloque_minutos)
+                while hora_bloque_chile < hora_fin_dia_chile:
+                    fin_bloque_chile = hora_bloque_chile + timedelta(minutes=horario.duracion_bloque_minutos)
                     
-                    if fin_bloque > hora_fin_dia:
+                    if fin_bloque_chile > hora_fin_dia_chile:
                         break
                     
+                    # Convertir a UTC para guardar en PostgreSQL
+                    inicio_utc = hora_bloque_chile.astimezone(timezone.utc)
+                    fin_utc = fin_bloque_chile.astimezone(timezone.utc)
+                    
                     bloques_a_crear.append({
-                        "inicio_bloque": hora_bloque.isoformat(),
-                        "finalizacion_bloque": fin_bloque.isoformat(),
+                        "inicio_bloque": inicio_utc.isoformat(),
+                        "finalizacion_bloque": fin_utc.isoformat(),
                         "usuario_sistema_id": horario.usuario_sistema_id
                     })
                     
-                    hora_bloque = fin_bloque
+                    hora_bloque_chile = fin_bloque_chile
             
             fecha_actual += timedelta(days=1)
         
@@ -191,9 +204,11 @@ async def listar_horarios(
 ):
     """
     Lista los horarios de los doctores.
-    Puede filtrar por doctor y rango de fechas.
+    Puede filtrar por doctor y rango de fechas (en hora Chile, no UTC).
     """
     try:
+        chile_tz = ZoneInfo("America/Santiago")
+        
         query = supabase_client.table("horarios_personal").select(
             "id, inicio_bloque, finalizacion_bloque, usuario_sistema_id, usuario_sistema(nombre, apellido_paterno, apellido_materno)"
         )
@@ -201,17 +216,53 @@ async def listar_horarios(
         if usuario_sistema_id:
             query = query.eq("usuario_sistema_id", usuario_sistema_id)
         
+        # Si hay filtros de fecha, ampliar el rango para cubrir conversiones de timezone
+        # Ampliar -1 día antes y +1 día después para no perder bloques en bordes
         if fecha_inicio:
-            query = query.gte("inicio_bloque", fecha_inicio)
+            dt_inicio = datetime.fromisoformat(fecha_inicio.replace('Z', '+00:00'))
+            dt_inicio_ampliado = dt_inicio - timedelta(days=1)
+            query = query.gte("inicio_bloque", dt_inicio_ampliado.isoformat())
         
         if fecha_fin:
-            query = query.lte("finalizacion_bloque", fecha_fin)
+            dt_fin = datetime.fromisoformat(fecha_fin.replace('Z', '+00:00'))
+            dt_fin_ampliado = dt_fin + timedelta(days=1)
+            query = query.lte("finalizacion_bloque", dt_fin_ampliado.isoformat())
         
         query = query.order("inicio_bloque", desc=False)
         
         result = query.execute()
         
-        return {"horarios": result.data or []}
+        # Filtrar bloques basándonos en fecha LOCAL Chile
+        horarios_filtrados = result.data or []
+        
+        if (fecha_inicio or fecha_fin) and horarios_filtrados:
+            horarios_finales = []
+            
+            for horario in horarios_filtrados:
+                # Convertir inicio_bloque a hora Chile
+                inicio_utc = datetime.fromisoformat(horario["inicio_bloque"].replace('Z', '+00:00'))
+                inicio_chile = inicio_utc.astimezone(chile_tz)
+                fecha_chile = inicio_chile.date()
+                
+                # Verificar si la fecha local está en el rango solicitado
+                incluir = True
+                
+                if fecha_inicio:
+                    fecha_inicio_dt = datetime.fromisoformat(fecha_inicio.replace('Z', '+00:00')).astimezone(chile_tz).date()
+                    if fecha_chile < fecha_inicio_dt:
+                        incluir = False
+                
+                if fecha_fin and incluir:
+                    fecha_fin_dt = datetime.fromisoformat(fecha_fin.replace('Z', '+00:00')).astimezone(chile_tz).date()
+                    if fecha_chile > fecha_fin_dt:
+                        incluir = False
+                
+                if incluir:
+                    horarios_finales.append(horario)
+            
+            return {"horarios": horarios_finales}
+        
+        return {"horarios": horarios_filtrados}
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -320,7 +371,7 @@ async def eliminar_horarios_doctor(
             query = query.gte("inicio_bloque", fecha_inicio)
         else:
             # Por defecto, solo eliminar horarios futuros
-            query = query.gte("inicio_bloque", datetime.now().isoformat())
+            query = query.gte("inicio_bloque", datetime.now(timezone.utc).isoformat())
         
         if fecha_fin:
             query = query.lte("finalizacion_bloque", fecha_fin)
