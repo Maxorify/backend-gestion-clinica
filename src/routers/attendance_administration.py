@@ -32,6 +32,297 @@ def parse_datetime_utc(dt_string: str) -> datetime:
         return datetime.fromisoformat(dt_string).replace(tzinfo=timezone.utc)
 
 
+# ============================================================================
+# ENDPOINT NUEVO: TURNOS TRABAJADOS (ASISTENCIA REAL)
+# ============================================================================
+
+@attendance_router.get("/turnos-trabajados", response_model=ResumenDiarioAsistencia)
+async def obtener_turnos_trabajados(
+    fecha: Optional[date] = Query(None, description="Fecha a consultar (default: hoy)"),
+):
+    """
+    📊 ENDPOINT PROFESIONAL: Obtiene turnos del día incluyendo asistencia real Y programados.
+    
+    Incluye:
+    - Doctores con asistencia REAL (marca_entrada) - agrupados por fecha trabajada
+    - Doctores PROGRAMADOS sin asistencia (ausentes/pendientes) - agrupados por fecha programada
+    
+    Casos de uso:
+    - Vista completa del día (trabajados + ausentes + programados)
+    - KPIs de asistencia
+    - Reportes completos
+    
+    Performance:
+    - Queries optimizadas con JOINs
+    - O(n) processing, no N+1 queries
+    """
+    fecha_consulta = fecha or date.today()
+    chile_tz = ZoneInfo("America/Santiago")
+    ahora = datetime.now(timezone.utc)
+    
+    try:
+        # PASO 1: Obtener horarios PROGRAMADOS del día
+        fecha_inicio_ampliada = fecha_consulta - timedelta(days=1)
+        fecha_fin_ampliada = fecha_consulta + timedelta(days=1)
+        
+        horarios_response = supabase_client.from_("horarios_personal") \
+            .select("*, usuario:usuario_sistema_id(id, nombre, apellido_paterno, apellido_materno, rut, email, celular)") \
+            .gte("inicio_bloque", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("finalizacion_bloque", f"{fecha_fin_ampliada}T23:59:59") \
+            .order("inicio_bloque", desc=False) \
+            .execute()
+        
+        print(f"🚨 DEBUG CRÍTICO: Horarios en DB para rango ampliado: {len(horarios_response.data or [])}")
+        
+        # Filtrar bloques que pertenecen a la fecha en hora Chile
+        horarios_chile = []
+        doctor_ids = set()
+        
+        print(f"🔍 DEBUG: Buscando horarios para fecha {fecha_consulta}")
+        print(f"🔍 DEBUG: Horarios encontrados en DB: {len(horarios_response.data or [])}")
+        
+        for h in (horarios_response.data or []):
+            if not h.get('usuario'):
+                print(f"⚠️  Bloque {h.get('id')} sin usuario, saltando")
+                continue
+            inicio_utc = parse_datetime_utc(h['inicio_bloque'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            doctor_nombre = f"{h['usuario'].get('nombre','')} {h['usuario'].get('apellido_paterno','')}"
+            print(f"🔍 Bloque: {doctor_nombre} - {h['inicio_bloque']} UTC → Chile: {inicio_chile.date()} (buscando: {fecha_consulta}) - Match: {inicio_chile.date() == fecha_consulta}")
+            if inicio_chile.date() == fecha_consulta:
+                horarios_chile.append(h)
+                doctor_ids.add(h['usuario']['id'])
+        
+        print(f"✅ Horarios filtrados: {len(horarios_chile)} doctores")
+        
+        # DEBUG TEMPORAL
+        if len(horarios_chile) < 5:
+            raise HTTPException(status_code=500, detail=f"DEBUG: Solo {len(horarios_chile)} horarios después del filtro. Esperaba 8. Fecha: {fecha_consulta}")
+        
+        if not horarios_chile:
+            return ResumenDiarioAsistencia(
+                fecha=fecha_consulta,
+                total_turnos=0,
+                en_turno=0,
+                asistieron=0,
+                con_atraso=0,
+                ausentes=0,
+                justificados=0,
+                turnos=[]
+            )
+        
+        doctor_ids = list(doctor_ids)
+        
+        # PASO 2: Obtener TODAS las asistencias de estos doctores (sin filtro de fecha)
+        # Para asociar correctamente asistencias con turnos programados
+        asistencias_response = supabase_client.from_("asistencia") \
+            .select("*") \
+            .in_("usuario_sistema_id", doctor_ids) \
+            .gte("inicio_turno", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("inicio_turno", f"{fecha_fin_ampliada}T23:59:59") \
+            .execute()
+        
+        # Crear diccionario de asistencias por doctor_id
+        # IMPORTANTE: No filtrar por fecha aquí, asociar por doctor
+        asistencias_dict = {}
+        if asistencias_response.data:
+            for asist in asistencias_response.data:
+                doctor_id = asist['usuario_sistema_id']
+                # Guardar la primera asistencia encontrada (o la más reciente)
+                if doctor_id not in asistencias_dict:
+                    asistencias_dict[doctor_id] = asist
+        
+        # PASO 3: Obtener especialidades de todos los doctores (bulk query)
+        especialidades_response = supabase_client.from_("especialidades_doctor") \
+            .select("usuario_sistema_id, especialidad:especialidad_id(nombre)") \
+            .in_("usuario_sistema_id", doctor_ids) \
+            .execute()
+        
+        especialidades_dict = {}
+        if especialidades_response.data:
+            for esp in especialidades_response.data:
+                doctor_id = esp['usuario_sistema_id']
+                if doctor_id not in especialidades_dict:
+                    especialidades_dict[doctor_id] = []
+                if esp.get('especialidad'):
+                    especialidades_dict[doctor_id].append(esp['especialidad']['nombre'])
+        
+        # PASO 4: Agrupar horarios por doctor
+        doctores_dict = {}
+        for horario in horarios_chile:
+            doctor_data = horario['usuario']
+            doctor_id = doctor_data['id']
+            
+            if doctor_id not in doctores_dict:
+                doctores_dict[doctor_id] = {
+                    'doctor': doctor_data,
+                    'bloques': [],
+                    'primer_bloque': horario,
+                    'inicio_turno': horario['inicio_bloque'],
+                    'finalizacion_turno': horario['finalizacion_bloque']
+                }
+            else:
+                doctores_dict[doctor_id]['finalizacion_turno'] = horario['finalizacion_bloque']
+            
+            doctores_dict[doctor_id]['bloques'].append(horario)
+        
+        # PASO 5: Obtener pacientes agendados (bulk query)
+        fecha_inicio_utc = datetime.combine(fecha_consulta, time.min).replace(tzinfo=chile_tz).astimezone(timezone.utc)
+        fecha_fin_utc = datetime.combine(fecha_consulta, time.max).replace(tzinfo=chile_tz).astimezone(timezone.utc)
+        
+        pacientes_response = supabase_client.from_("cita_medica") \
+            .select("doctor_id, fecha_atencion") \
+            .in_("doctor_id", doctor_ids) \
+            .gte("fecha_atencion", fecha_inicio_utc.isoformat()) \
+            .lte("fecha_atencion", fecha_fin_utc.isoformat()) \
+            .execute()
+        
+        pacientes_dict = {}
+        if pacientes_response.data:
+            for cita in pacientes_response.data:
+                fecha_utc = parse_datetime_utc(cita['fecha_atencion'])
+                fecha_chile = fecha_utc.astimezone(chile_tz)
+                if fecha_chile.date() == fecha_consulta:
+                    doctor_id = cita['doctor_id']
+                    pacientes_dict[doctor_id] = pacientes_dict.get(doctor_id, 0) + 1
+        
+        # PASO 6: Procesar cada doctor (programado o con asistencia)
+        turnos_procesados = []
+        stats = {"en_turno": 0, "asistieron": 0, "con_atraso": 0, "ausentes": 0, "justificados": 0}
+        
+        for doctor_id, info in doctores_dict.items():
+            doctor_data = info['doctor']
+            
+            # Obtener asistencia del diccionario
+            asistencia = asistencias_dict.get(doctor_id)
+            
+            # Obtener especialidades
+            especialidades = especialidades_dict.get(doctor_id, [])
+            
+            # Construir objeto doctor
+            doctor = DoctorBasicInfo(
+                id=doctor_id,
+                nombre=doctor_data.get("nombre", ""),
+                apellido_paterno=doctor_data.get("apellido_paterno", ""),
+                apellido_materno=doctor_data.get("apellido_materno", ""),
+                nombre_completo=f"{doctor_data.get('nombre', '')} {doctor_data.get('apellido_paterno', '')} {doctor_data.get('apellido_materno', '')}".strip(),
+                rut=doctor_data.get("rut"),
+                especialidades=especialidades,
+                email=doctor_data.get("email"),
+                celular=doctor_data.get("celular")
+            )
+            
+            # Pacientes agendados
+            pacientes_agendados = pacientes_dict.get(doctor_id, 0)
+            
+            # Calcular estado y tiempos
+            if asistencia:
+                # Tiene asistencia registrada
+                inicio_real = parse_datetime_utc(asistencia['inicio_turno'])
+                fin_real = parse_datetime_utc(asistencia['finalizacion_turno']) if asistencia.get('finalizacion_turno') else None
+                
+                inicio_programado = parse_datetime_utc(info['inicio_turno'])
+                
+                # Calcular atraso
+                minutos_atraso = max(0, int((inicio_real - inicio_programado).total_seconds() / 60))
+                
+                # Calcular minutos trabajados
+                if fin_real:
+                    minutos_trabajados = int((fin_real - inicio_real).total_seconds() / 60)
+                    if minutos_atraso > 0:
+                        estado = "ATRASO"
+                        stats["con_atraso"] += 1
+                    else:
+                        estado = "ASISTIO"
+                        stats["asistieron"] += 1
+                else:
+                    # Sin salida - verificar si el turno ya terminó
+                    fin_programado = parse_datetime_utc(info['finalizacion_turno'])
+                    
+                    if ahora > fin_programado:
+                        # Turno terminó - auto-cerrar
+                        minutos_trabajados = int((fin_programado - inicio_real).total_seconds() / 60)
+                        if minutos_atraso > 0:
+                            estado = "ATRASO"
+                            stats["con_atraso"] += 1
+                        else:
+                            estado = "ASISTIO"
+                            stats["asistieron"] += 1
+                    else:
+                        # Aún en turno
+                        minutos_trabajados = int((ahora - inicio_real).total_seconds() / 60)
+                        if minutos_atraso > 0:
+                            estado = "ATRASO"
+                            stats["con_atraso"] += 1
+                        else:
+                            estado = "EN_TURNO"
+                            stats["en_turno"] += 1
+                
+                marca_entrada = inicio_real
+                marca_salida = fin_real
+            else:
+                # No tiene asistencia - doctor programado sin marcar
+                inicio_programado = parse_datetime_utc(info['inicio_turno'])
+                fin_programado = parse_datetime_utc(info['finalizacion_turno'])
+                
+                if ahora >= fin_programado:
+                    # Turno ya terminó y nunca marcó
+                    estado = "AUSENTE"
+                    stats["ausentes"] += 1
+                elif ahora >= inicio_programado:
+                    # Ya debería haber iniciado pero no marcó
+                    estado = "ATRASADO"
+                    stats["con_atraso"] += 1
+                else:
+                    # Aún no llega la hora
+                    estado = "PROGRAMADO"
+                    stats["en_turno"] += 1
+                
+                minutos_atraso = 0
+                minutos_trabajados = None
+                marca_entrada = None
+                marca_salida = None
+            
+            # Construir turno
+            turno_detalle = TurnoAsistenciaDetalle(
+                id=asistencia['id'] if asistencia else info['primer_bloque']['id'],
+                horario_id=info['primer_bloque']['id'],
+                inicio_turno=parse_datetime_utc(info['inicio_turno']),
+                finalizacion_turno=parse_datetime_utc(info['finalizacion_turno']),
+                doctor=doctor,
+                estado_asistencia=estado,
+                minutos_atraso=minutos_atraso,
+                minutos_trabajados=minutos_trabajados,
+                porcentaje_asistencia=None,
+                marca_entrada=marca_entrada,
+                marca_salida=marca_salida,
+                fuente_entrada=None,
+                fuente_salida=None,
+                justificacion=None,
+                tipo_justificacion=None,
+                pacientes_agendados=pacientes_agendados,
+                pacientes_atendidos=0,
+                created_at=datetime.now(timezone.utc)
+            )
+            
+            turnos_procesados.append(turno_detalle)
+        
+        return ResumenDiarioAsistencia(
+            fecha=fecha_consulta,
+            total_turnos=len(turnos_procesados),
+            en_turno=stats["en_turno"],
+            asistieron=stats["asistieron"],
+            con_atraso=stats["con_atraso"],
+            ausentes=stats["ausentes"],
+            justificados=stats["justificados"],
+            turnos=turnos_procesados
+        )
+        
+    except Exception as e:
+        print(f"❌ Error en /turnos-trabajados: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al obtener turnos trabajados: {str(e)}")
+
+
 @attendance_router.get("/turnos-dia", response_model=ResumenDiarioAsistencia)
 async def obtener_turnos_dia(
     fecha: Optional[date] = Query(None, description="Fecha a consultar (default: hoy)"),
@@ -61,6 +352,7 @@ async def obtener_turnos_dia(
         for h in (horarios_response.data or []):
             inicio_utc = parse_datetime_utc(h['inicio_bloque'])
             inicio_chile = inicio_utc.astimezone(chile_tz)
+            print(f"🔍 DEBUG: Bloque UTC: {h['inicio_bloque']} → Chile: {inicio_chile} → Fecha Chile: {inicio_chile.date()} (buscando: {fecha_consulta})")
             if inicio_chile.date() == fecha_consulta:
                 horarios_chile.append(h)
         
@@ -145,9 +437,9 @@ async def obtener_turnos_dia(
                     doctor_id = cita['doctor_id']
                     pacientes_dict[doctor_id] = pacientes_dict.get(doctor_id, 0) + 1
         
-        # Agrupar horarios por doctor
+        # Agrupar horarios por doctor - SOLO bloques del día consultado
         doctores_dict = {}
-        for horario in horarios_response.data:
+        for horario in horarios_chile:  # Usar horarios_chile que ya está filtrado por fecha
             if not horario.get('usuario'):
                 continue
                 
@@ -217,16 +509,30 @@ async def obtener_turnos_dia(
                         estado = "ASISTIO"
                         stats["asistieron"] += 1
                 else:
-                    # Aún en turno
+                    # Marcó entrada pero no salida - verificar si el turno ya terminó
                     ahora = datetime.now(inicio_real.tzinfo)
-                    minutos_trabajados = int((ahora - inicio_real).total_seconds() / 60)
-                    # Si llegó con atraso, aunque esté en turno
-                    if minutos_atraso > 0:
-                        estado = "ATRASO"
-                        stats["con_atraso"] += 1
+                    fin_programado = parse_datetime_utc(info['finalizacion_turno'])
+                    
+                    if ahora > fin_programado:
+                        # El turno ya terminó - cerrar automáticamente con hora programada
+                        minutos_trabajados = int((fin_programado - inicio_real).total_seconds() / 60)
+                        # Contar como asistió (aunque con atraso si corresponde)
+                        if minutos_atraso > 0:
+                            estado = "ATRASO"
+                            stats["con_atraso"] += 1
+                        else:
+                            estado = "ASISTIO"
+                            stats["asistieron"] += 1
                     else:
-                        estado = "EN_TURNO"
-                        stats["en_turno"] += 1
+                        # Aún en turno
+                        minutos_trabajados = int((ahora - inicio_real).total_seconds() / 60)
+                        # Si llegó con atraso, aunque esté en turno
+                        if minutos_atraso > 0:
+                            estado = "ATRASO"
+                            stats["con_atraso"] += 1
+                        else:
+                            estado = "EN_TURNO"
+                            stats["en_turno"] += 1
                 
                 marca_entrada = inicio_real
                 marca_salida = fin_real
@@ -1161,3 +1467,164 @@ async def marcar_salida_doctor(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al marcar salida: {str(e)}")
+
+
+@attendance_router.get("/doctor/{doctor_id}/historial-reciente")
+async def obtener_historial_reciente_doctor(
+    doctor_id: int,
+    dias: int = Query(30, description="Cantidad de días hacia atrás", ge=1, le=90)
+):
+    """
+    📈 OPTIMIZADO: Historial de asistencia REAL de un doctor (últimos N días).
+    
+    Basado en marca_entrada (asistencia real), no en horarios programados.
+    Performance: 3 queries totales (asistencias, horarios, especialidades).
+    """
+    try:
+        chile_tz = ZoneInfo("America/Santiago")
+        ahora = datetime.now(chile_tz)
+        fecha_inicio = (ahora - timedelta(days=dias)).date()
+        fecha_fin = ahora.date()
+        
+        # PASO 1: Query de asistencias reales del doctor en el rango
+        fecha_inicio_utc = datetime.combine(fecha_inicio, time.min).replace(tzinfo=chile_tz).astimezone(timezone.utc)
+        fecha_fin_utc = datetime.combine(fecha_fin, time.max).replace(tzinfo=chile_tz).astimezone(timezone.utc)
+        
+        asistencias_response = supabase_client.from_("asistencia") \
+            .select("*") \
+            .eq("usuario_sistema_id", doctor_id) \
+            .gte("inicio_turno", fecha_inicio_utc.isoformat()) \
+            .lte("inicio_turno", fecha_fin_utc.isoformat()) \
+            .order("inicio_turno", desc=True) \
+            .execute()
+        
+        if not asistencias_response.data:
+            return {"turnos": [], "total": 0}
+        
+        # PASO 2: Obtener info del doctor (una sola vez)
+        doctor_response = supabase_client.from_("usuario_sistema") \
+            .select("id, nombre, apellido_paterno, apellido_materno, rut, email, celular") \
+            .eq("id", doctor_id) \
+            .single() \
+            .execute()
+        
+        if not doctor_response.data:
+            raise HTTPException(status_code=404, detail="Doctor no encontrado")
+        
+        doctor_data = doctor_response.data
+        
+        # PASO 3: Obtener especialidades
+        especialidades_response = supabase_client.from_("especialidades_doctor") \
+            .select("especialidad:especialidad_id(nombre)") \
+            .eq("usuario_sistema_id", doctor_id) \
+            .execute()
+        
+        especialidades = [
+            esp['especialidad']['nombre'] 
+            for esp in (especialidades_response.data or [])
+            if esp.get('especialidad')
+        ]
+        
+        doctor = DoctorBasicInfo(
+            id=doctor_data['id'],
+            nombre=doctor_data.get('nombre', ''),
+            apellido_paterno=doctor_data.get('apellido_paterno', ''),
+            apellido_materno=doctor_data.get('apellido_materno', ''),
+            nombre_completo=f"{doctor_data.get('nombre', '')} {doctor_data.get('apellido_paterno', '')} {doctor_data.get('apellido_materno', '')}".strip(),
+            rut=doctor_data.get('rut', ''),
+            especialidades=especialidades,
+            email=doctor_data.get('email', ''),
+            celular=doctor_data.get('celular', '')
+        )
+        
+        # PASO 4: Obtener horarios programados del rango (para calcular atraso)
+        fecha_inicio_ampliada = fecha_inicio - timedelta(days=1)
+        fecha_fin_ampliada = fecha_fin + timedelta(days=1)
+        
+        horarios_response = supabase_client.from_("horarios_personal") \
+            .select("inicio_bloque, finalizacion_bloque") \
+            .eq("usuario_sistema_id", doctor_id) \
+            .gte("inicio_bloque", f"{fecha_inicio_ampliada}T00:00:00") \
+            .lte("finalizacion_bloque", f"{fecha_fin_ampliada}T23:59:59") \
+            .execute()
+        
+        # Agrupar horarios por fecha Chile
+        horarios_por_fecha = {}
+        for horario in (horarios_response.data or []):
+            inicio_utc = parse_datetime_utc(horario['inicio_bloque'])
+            inicio_chile = inicio_utc.astimezone(chile_tz)
+            fecha_key = inicio_chile.date().isoformat()
+            
+            if fecha_key not in horarios_por_fecha:
+                horarios_por_fecha[fecha_key] = {
+                    'inicio': inicio_utc,
+                    'fin': parse_datetime_utc(horario['finalizacion_bloque'])
+                }
+            else:
+                # Actualizar fin si es posterior
+                fin_actual = parse_datetime_utc(horario['finalizacion_bloque'])
+                if fin_actual > horarios_por_fecha[fecha_key]['fin']:
+                    horarios_por_fecha[fecha_key]['fin'] = fin_actual
+        
+        # PASO 5: Procesar asistencias
+        turnos_resultado = []
+        ahora_utc = datetime.now(timezone.utc)
+        
+        for asist in asistencias_response.data:
+            inicio_real = parse_datetime_utc(asist['inicio_turno'])
+            inicio_chile = inicio_real.astimezone(chile_tz)
+            fecha_key = inicio_chile.date().isoformat()
+            
+            fin_real = parse_datetime_utc(asist['finalizacion_turno']) if asist.get('finalizacion_turno') else None
+            
+            # Obtener horario programado del día
+            horario_prog = horarios_por_fecha.get(fecha_key)
+            
+            # Calcular atraso
+            minutos_atraso = 0
+            if horario_prog:
+                atraso_segundos = (inicio_real - horario_prog['inicio']).total_seconds()
+                minutos_atraso = max(0, int(atraso_segundos / 60))
+            
+            # Calcular estado y minutos trabajados
+            if fin_real:
+                minutos_trabajados = int((fin_real - inicio_real).total_seconds() / 60)
+                estado = "ATRASO" if minutos_atraso > 0 else "ASISTIO"
+            else:
+                if horario_prog and ahora_utc > horario_prog['fin']:
+                    minutos_trabajados = int((horario_prog['fin'] - inicio_real).total_seconds() / 60)
+                    estado = "ATRASO" if minutos_atraso > 0 else "ASISTIO"
+                else:
+                    minutos_trabajados = int((ahora_utc - inicio_real).total_seconds() / 60)
+                    estado = "EN_TURNO"
+            
+            turno = TurnoAsistenciaDetalle(
+                id=asist['id'],
+                horario_id=None,
+                inicio_turno=horario_prog['inicio'] if horario_prog else inicio_real,
+                finalizacion_turno=horario_prog['fin'] if horario_prog else (fin_real or inicio_real),
+                doctor=doctor,
+                estado_asistencia=estado,
+                minutos_atraso=minutos_atraso,
+                minutos_trabajados=minutos_trabajados,
+                porcentaje_asistencia=None,
+                marca_entrada=inicio_real,
+                marca_salida=fin_real,
+                fuente_entrada=None,
+                fuente_salida=None,
+                justificacion=None,
+                tipo_justificacion=None,
+                pacientes_agendados=0,
+                pacientes_atendidos=0,
+                created_at=parse_datetime_utc(asist.get('created_at')) if asist.get('created_at') else datetime.now(timezone.utc)
+            )
+            
+            turnos_resultado.append(turno)
+        
+        return {"turnos": turnos_resultado, "total": len(turnos_resultado)}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error en historial reciente: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al obtener historial: {str(e)}")
