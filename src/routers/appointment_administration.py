@@ -1172,19 +1172,25 @@ async def obtener_citas_doctor(
     """
     Obtiene las citas de un doctor específico filtradas por fecha y estados.
     estados: string separado por comas, ej: "Confirmada,En Consulta"
+    
+    IMPORTANTE: fecha se interpreta en hora de Chile (UTC-3).
     """
     try:
         print(f"🔍 DEBUG - Doctor ID recibido: {doctor_id}")
         print(f"🔍 DEBUG - Fecha recibida: {fecha}")
         print(f"🔍 DEBUG - Estados recibidos: {estados}")
         
-        # Construir query base
+        # Construir query base CON especialidad incluida
         query = (
             supabase_client
             .table("cita_medica")
             .select("""
                 id,
                 fecha_atencion,
+                especialidad_id,
+                especialidad:especialidad_id(
+                    id, nombre
+                ),
                 paciente:paciente_id(
                     id, nombre, apellido_paterno, apellido_materno, 
                     fecha_nacimiento, telefono, rut, correo, sexo,
@@ -1195,8 +1201,23 @@ async def obtener_citas_doctor(
         )
 
         # Filtrar por fecha si se proporciona
+        # CONVERSIÓN TIMEZONE: fecha se interpreta en hora Chile (UTC-3)
         if fecha:
-            query = query.gte("fecha_atencion", f"{fecha}T00:00:00").lte("fecha_atencion", f"{fecha}T23:59:59")
+            # Parsear fecha del parámetro (YYYY-MM-DD)
+            fecha_chile = datetime.strptime(fecha, "%Y-%m-%d")
+            
+            # Convertir a UTC: Chile está en UTC-3, entonces UTC = Chile + 3h
+            # Inicio del día: 00:00 Chile = 03:00 UTC
+            # Fin del día: 23:59:59 Chile = 02:59:59 UTC del día siguiente
+            inicio_utc = fecha_chile + timedelta(hours=3)
+            fin_utc = fecha_chile + timedelta(days=1, hours=3)
+            
+            print(f"🔍 DEBUG - Conversión timezone:")
+            print(f"   Fecha Chile: {fecha_chile}")
+            print(f"   Inicio UTC: {inicio_utc.isoformat()}")
+            print(f"   Fin UTC: {fin_utc.isoformat()}")
+            
+            query = query.gte("fecha_atencion", inicio_utc.isoformat()).lt("fecha_atencion", fin_utc.isoformat())
 
         citas = query.order("fecha_atencion", desc=False).execute()
         
@@ -2181,6 +2202,165 @@ async def obtener_actividad_reciente(fecha: Optional[str] = None):
 
     except Exception as e:
         print(f"❌ Error en actividad-reciente: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@appointment_router.get("/doctor/{doctor_id}/productividad-mensual")
+async def obtener_productividad_mensual(doctor_id: int, mes: int, anio: int):
+    """
+    Endpoint OPTIMIZADO para reporte de productividad mensual.
+    Retorna en UNA SOLA LLAMADA todas las citas y pagos del mes especificado.
+    
+    Optimizaciones:
+    - Bulk query con JOINs (no N+1)
+    - Filtrado a nivel de BD (no en aplicación)
+    - Una sola transacción
+    """
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        
+        chile_tz = ZoneInfo("America/Santiago")
+        
+        # Calcular rango del mes en UTC
+        primer_dia = datetime(anio, mes, 1, 0, 0, 0, tzinfo=chile_tz)
+        if mes == 12:
+            ultimo_dia = datetime(anio + 1, 1, 1, 0, 0, 0, tzinfo=chile_tz)
+        else:
+            ultimo_dia = datetime(anio, mes + 1, 1, 0, 0, 0, tzinfo=chile_tz)
+        
+        # Convertir a UTC para query
+        primer_dia_utc = primer_dia.astimezone(ZoneInfo("UTC"))
+        ultimo_dia_utc = ultimo_dia.astimezone(ZoneInfo("UTC"))
+        
+        print(f"🔍 Buscando productividad doctor {doctor_id} - {mes}/{anio}")
+        print(f"   Rango UTC: {primer_dia_utc.isoformat()} a {ultimo_dia_utc.isoformat()}")
+        
+        # Query OPTIMIZADO: Una sola consulta con JOINs
+        citas_response = (
+            supabase_client
+            .table("cita_medica")
+            .select("""
+                id,
+                fecha_atencion,
+                especialidad_id,
+                especialidad:especialidad_id(
+                    id, nombre
+                ),
+                paciente:paciente_id(
+                    id, nombre, apellido_paterno
+                )
+            """)
+            .eq("doctor_id", doctor_id)
+            .gte("fecha_atencion", primer_dia_utc.isoformat())
+            .lt("fecha_atencion", ultimo_dia_utc.isoformat())
+            .order("fecha_atencion")
+            .execute()
+        )
+        
+        citas = citas_response.data or []
+        print(f"✅ {len(citas)} citas encontradas en el mes")
+        
+        if not citas:
+            return {
+                "citas": [],
+                "pagos": [],
+                "resumen": {
+                    "total_citas": 0,
+                    "citas_completadas": 0,
+                    "total_ingresos": 0,
+                    "especialidades": {}
+                }
+            }
+        
+        # Obtener estados en BULK (una sola query)
+        citas_ids = [c["id"] for c in citas]
+        estados_response = (
+            supabase_client
+            .table("estado")
+            .select("cita_medica_id, estado, id")
+            .in_("cita_medica_id", citas_ids)
+            .order("id", desc=True)
+            .execute()
+        )
+        
+        # Crear diccionario de estados (último estado por cita)
+        estados_dict = {}
+        for estado in (estados_response.data or []):
+            cita_id = estado["cita_medica_id"]
+            if cita_id not in estados_dict:
+                estados_dict[cita_id] = estado["estado"]
+        
+        print(f"✅ Estados recuperados para {len(estados_dict)} citas")
+        
+        # Obtener pagos en BULK (una sola query)
+        pagos_response = (
+            supabase_client
+            .table("pagos")
+            .select("id, total, fecha_pago, cita_medica_id")
+            .in_("cita_medica_id", citas_ids)
+            .execute()
+        )
+        
+        pagos = pagos_response.data or []
+        print(f"✅ {len(pagos)} pagos encontrados")
+        
+        # Crear diccionario de pagos por cita
+        pagos_dict = {}
+        for pago in pagos:
+            cita_id = pago["cita_medica_id"]
+            if cita_id not in pagos_dict:
+                pagos_dict[cita_id] = []
+            pagos_dict[cita_id].append(pago)
+        
+        # Construir respuesta enriquecida
+        citas_enriquecidas = []
+        total_ingresos = 0
+        citas_completadas = 0
+        especialidades = {}
+        
+        for cita in citas:
+            cita_id = cita["id"]
+            estado = estados_dict.get(cita_id, "Sin estado")
+            pagos_cita = pagos_dict.get(cita_id, [])
+            monto_total_cita = sum(float(p["total"]) for p in pagos_cita)
+            
+            # Contar completadas
+            if estado in ["Completada", "En Consulta"]:
+                citas_completadas += 1
+            
+            # Sumar ingresos
+            total_ingresos += monto_total_cita
+            
+            # Agrupar especialidades
+            if cita.get("especialidad"):
+                esp_nombre = cita["especialidad"].get("nombre", "Sin especialidad")
+                especialidades[esp_nombre] = especialidades.get(esp_nombre, 0) + 1
+            
+            citas_enriquecidas.append({
+                **cita,
+                "estado_actual": estado,
+                "pagos": pagos_cita,
+                "monto_total": monto_total_cita
+            })
+        
+        print(f"💰 Total ingresos calculado: ${total_ingresos:,.0f}")
+        
+        return {
+            "citas": citas_enriquecidas,
+            "pagos": pagos,
+            "resumen": {
+                "total_citas": len(citas),
+                "citas_completadas": citas_completadas,
+                "total_ingresos": total_ingresos,
+                "especialidades": especialidades
+            }
+        }
+        
+    except Exception as e:
+        print(f"❌ Error en productividad-mensual: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

@@ -447,7 +447,7 @@ async def listar_horarios_disponibles(
 
         # Obtener TODAS las citas del doctor en el rango de fechas
         citas_doctor = supabase_client.table("cita_medica").select(
-            "id, fecha_atencion, doctor_id, estado(estado)"
+            "id, fecha_atencion, doctor_id"
         ).eq("doctor_id", doctor_id).gte(
             "fecha_atencion", fecha_inicio_dt.isoformat()
         ).lte("fecha_atencion", fecha_fin_dt.isoformat()).execute()
@@ -464,17 +464,22 @@ async def listar_horarios_disponibles(
         horarios_ocupados = set()
 
         for cita in (citas_doctor.data or []):
-            # Obtener el estado de la cita
-            estado_list = cita.get("estado", [])
-            if estado_list:
-                estado_actual = estado_list[0].get("estado") if isinstance(estado_list, list) else estado_list.get("estado")
-                # Ignorar citas canceladas
-                if estado_actual == "Cancelada":
-                    print(f"DEBUG: Ignorando cita cancelada ID {cita['id']}")
-                    continue
+            # Obtener el estado ACTUAL de la cita (el más reciente)
+            estado_response = supabase_client.table("estado").select(
+                "estado"
+            ).eq("cita_medica_id", cita["id"]).order("id", desc=True).limit(1).execute()
+            
+            estado_actual = None
+            if estado_response.data:
+                estado_actual = estado_response.data[0].get("estado")
+            
+            # Ignorar citas canceladas
+            if estado_actual == "Cancelada":
+                print(f"DEBUG: Ignorando cita cancelada ID {cita['id']}")
+                continue
 
             fecha_cita = datetime.fromisoformat(cita["fecha_atencion"].replace('Z', '+00:00'))
-            print(f"DEBUG: Procesando cita {cita['id']} con fecha {fecha_cita}")
+            print(f"DEBUG: Procesando cita {cita['id']} con estado '{estado_actual}' y fecha {fecha_cita}")
 
             # Verificar qué horario ocupa esta cita
             for horario in horarios.data:
